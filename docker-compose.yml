@@ -1,0 +1,24 @@
+version: '3.8'
+
+volumes:
+  budget_data:
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=sqlite:///./budget.db
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "3001:3001"
+    depends_on:
+      - backend
+    # No REACT_APP_API_URL needed — api.js uses window.location.hostname:5000 at runtime

@@ -1,0 +1,15 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+sqlalchemy==2.0.23
+alembic==1.12.1
+pydantic==2.5.0
+python-multipart==0.0.6
+pandas==2.1.4
+matplotlib==3.8.2
+seaborn==0.13.0
+scikit-learn==1.3.2
+plaid-python==16.0.0
+openai>=1.0.0
+# AI provider: set GROQ_API_KEY (free at console.groq.com) OR OPENAI_API_KEY in backend/.env
+# GROQ_API_KEY is preferred when both are present (free tier, no quota issues)
+python-dotenv==1.0.0

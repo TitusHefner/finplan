@@ -1,0 +1,11 @@
+backend\.env
+backend\*.db
+backend\*.sqlite
+backend\*.sqlite3
+__pycache__
+*.pyc
+*.pyo
+node_modules
+.vscode
+.conda
+.git

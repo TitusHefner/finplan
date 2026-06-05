@@ -1,0 +1,27 @@
+# Personal Backup Restore Instructions
+
+## New Machine Setup
+
+### 1. Install prerequisites
+   - Python 3.11+  (https://www.python.org/downloads/)
+   - Node.js 18+   (https://nodejs.org)
+   - Miniconda     (https://docs.conda.io/en/latest/miniconda.html)
+
+### 2. Set up conda environment
+   conda create -n fin python=3.11 -y
+   conda activate fin
+   cd backend
+   pip install -r requirements.txt
+
+### 3. Restore your database
+   The database-backup\budget.db file contains all your financial data.
+   Copy it to:  %LOCALAPPDATA%\SmartBudget\budget.db
+
+   PowerShell one-liner:
+     $dst = "$env:LOCALAPPDATA\SmartBudget"; New-Item $dst -ItemType Directory -Force; Copy-Item "database-backup\budget.db" "$dst\budget.db"
+
+### 4. Start the app
+   Double-click start.bat
+   Then open http://localhost:3001
+
+### 5. Your credentials are already in backend\.env — no action needed.
