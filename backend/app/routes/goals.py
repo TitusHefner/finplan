@@ -836,7 +836,7 @@ def _simulate_fixed_card_plus_student_strategy(
             key=_student_key,
         )
         if student_extra_used > 0 and student_targets:
-            # Apply "minimum + student X" to the current attack loan first.
+            # Apply "minimum + extra debt payment amount" to the current attack loan first.
             current_target = student_targets[0]
             target_min_for_month = _student_required_minimum(current_target, month)
             target_effective_min = max(target_min_for_month, current_target["estimated_minimum"])

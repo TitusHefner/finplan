@@ -194,7 +194,9 @@ export default function DebtsDashboard() {
   const [strategyData, setStrategyData] = useState(null);
   const [strategyLoading, setStrategyLoading] = useState(false);
   const [selectedCardAccount, setSelectedCardAccount] = useState('');
-  const [manualStudentX, setManualStudentX] = useState('');
+  const [manualExtraDebtPaymentAmount, setManualExtraDebtPaymentAmount] = useState(
+    () => localStorage.getItem('extraDebtPaymentAmountOverride') || ''
+  );
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -251,7 +253,7 @@ export default function DebtsDashboard() {
         ignore_estimated_student_minimums: true,
         graduation_date: '2026-05-15',
         grace_period_months: 6,
-        student_extra_override: manualStudentX === '' ? null : Number(manualStudentX || 0),
+        student_extra_override: manualExtraDebtPaymentAmount === '' ? null : Number(manualExtraDebtPaymentAmount || 0),
       };
       const res = await axios.post('/api/goals/debt-strategy', payload);
       setStrategyData(res.data);
@@ -260,7 +262,7 @@ export default function DebtsDashboard() {
     } finally {
       setStrategyLoading(false);
     }
-  }, [manualStudentX]);
+  }, [manualExtraDebtPaymentAmount]);
 
   useEffect(() => {
     if (!allDebts.length) {
@@ -269,6 +271,14 @@ export default function DebtsDashboard() {
     }
     fetchStrategy(allDebts);
   }, [allDebts, fetchStrategy]);
+
+  useEffect(() => {
+    if (manualExtraDebtPaymentAmount === '') {
+      localStorage.removeItem('extraDebtPaymentAmountOverride');
+      return;
+    }
+    localStorage.setItem('extraDebtPaymentAmountOverride', String(manualExtraDebtPaymentAmount));
+  }, [manualExtraDebtPaymentAmount]);
 
   const studentDebts = useMemo(
     () => allDebts.filter(d => d.debtType === 'student_loan'),
@@ -512,7 +522,7 @@ export default function DebtsDashboard() {
             <div style={styles.grid4}>
               <Metric title='Plan Debt-Free' value={`M${customPlan.months_to_debt_free || 0}`} color='#1f618d' />
               <Metric title='Projected Debt-Free Date' value={payoffDateFromNow(customPlan.months_to_debt_free)} color='#117864' />
-              <Metric title='Student X In Use' value={fmt(customPlan.student_extra_payment_used)} color='#1e8449' />
+              <Metric title='Extra Debt Payment Amount In Use' value={fmt(customPlan.student_extra_payment_used)} color='#1e8449' />
               <Metric title='Plan Interest (Total)' value={fmt(customPlan.total_interest_paid)} color='#a04000' />
             </div>
           )}
@@ -609,7 +619,7 @@ export default function DebtsDashboard() {
                   />
                 </div>
                 <p style={styles.footnote}>
-                  Uses strategy assumptions: fixed AAdvantage payment ({fmt(strategyData?.custom_plan?.fixed_card_monthly_payment)}) and student {String(strategyData?.custom_plan?.student_strategy || 'avalanche')} with recommended extra X of {fmt(strategyData?.custom_plan?.recommended_student_extra_payment)}.
+                  Uses strategy assumptions: fixed AAdvantage payment ({fmt(strategyData?.custom_plan?.fixed_card_monthly_payment)}) and student {String(strategyData?.custom_plan?.student_strategy || 'avalanche')} with recommended extra debt payment amount of {fmt(strategyData?.custom_plan?.recommended_student_extra_payment)}.
                 </p>
               </>
             )}
@@ -716,7 +726,7 @@ export default function DebtsDashboard() {
                 <Metric title='Fixed Card Target' value={strategyData.custom_plan?.fixed_card || 'N/A'} color='#922b21' />
                 <Metric title='Fixed Card Monthly Pay' value={fmt(strategyData.custom_plan?.fixed_card_monthly_payment)} color='#922b21' />
                 <Metric
-                  title={strategyData.custom_plan?.student_extra_is_manual_override ? 'Student X (Manual)' : 'Recommended Student X'}
+                  title={strategyData.custom_plan?.student_extra_is_manual_override ? 'Extra Debt Payment Amount (Manual)' : 'Recommended Extra Debt Payment Amount'}
                   value={fmt(strategyData.custom_plan?.student_extra_payment_used)}
                   color='#1e8449'
                 />
@@ -733,9 +743,9 @@ export default function DebtsDashboard() {
                 <h3 style={styles.panelTitle}>Plan Assumptions</h3>
                 <div style={styles.infoRow}><strong>Card Focus:</strong> {customPlan?.fixed_card || 'N/A'} at {fmt(customPlan?.fixed_card_monthly_payment)} / month</div>
                 <div style={styles.infoRow}><strong>Student Strategy:</strong> {String(customPlan?.student_strategy || 'avalanche').toUpperCase()}</div>
-                <div style={styles.infoRow}><strong>Student X Source:</strong> {customPlan?.student_extra_is_manual_override ? 'Manual override' : 'Cashflow auto-calc'}</div>
-                <div style={styles.infoRow}><strong>Student X Used:</strong> {fmt(customPlan?.student_extra_payment_used)}</div>
-                <div style={styles.infoRow}><strong>Student X Recommended:</strong> {fmt(customPlan?.recommended_student_extra_payment)}</div>
+                <div style={styles.infoRow}><strong>Extra Debt Payment Amount Source:</strong> {customPlan?.student_extra_is_manual_override ? 'Manual override' : 'Cashflow auto-calc'}</div>
+                <div style={styles.infoRow}><strong>Extra Debt Payment Amount Used:</strong> {fmt(customPlan?.student_extra_payment_used)}</div>
+                <div style={styles.infoRow}><strong>Extra Debt Payment Amount Recommended:</strong> {fmt(customPlan?.recommended_student_extra_payment)}</div>
                 <div style={styles.infoRow}><strong>Grace End Assumption:</strong> {customPlan?.grace_period?.assumed_grace_end_date ? new Date(customPlan.grace_period.assumed_grace_end_date).toLocaleDateString() : 'Per account due date / unknown'}</div>
                 <div style={styles.infoRow}><strong>Income - Non-Debt Expenses (Est.):</strong> {fmt((strategyData.context?.monthly_income_estimate || 0) - (strategyData.context?.monthly_non_debt_expenses_estimate || 0))}</div>
               </div>
@@ -750,27 +760,27 @@ export default function DebtsDashboard() {
 
               <div style={styles.panel}>
                 <div style={styles.rowBetween}>
-                  <h3 style={styles.panelTitle}>Student X Override</h3>
+                  <h3 style={styles.panelTitle}>Extra Debt Payment Amount Override</h3>
                 </div>
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                   <label style={styles.inlineInput}>
-                    Manual monthly Student X
+                    Manual monthly extra debt payment amount
                     <input
                       type='number'
                       min='0'
                       step='25'
-                      value={manualStudentX}
-                      onChange={e => setManualStudentX(e.target.value)}
+                      value={manualExtraDebtPaymentAmount}
+                      onChange={e => setManualExtraDebtPaymentAmount(e.target.value)}
                       placeholder='Auto-calc from cashflow'
                       style={styles.numberInput}
                     />
                   </label>
                   <button
-                    onClick={() => setManualStudentX('')}
+                    onClick={() => setManualExtraDebtPaymentAmount('')}
                     style={styles.refreshBtn}
                     type='button'
                   >
-                    Use Auto X
+                    Use Auto Amount
                   </button>
                 </div>
                 <p style={styles.footnote}>
@@ -781,7 +791,7 @@ export default function DebtsDashboard() {
               <div style={styles.panel}>
                 <h3 style={styles.panelTitle}>Student Loan Attack Order</h3>
                 <p style={styles.footnote}>
-                  Ordered by the selected student strategy. Loans in grace get no required payment until grace ends, unless they are the active attack loan receiving minimum + X.
+                  Ordered by the selected student strategy. Loans in grace get no required payment until grace ends, unless they are the active attack loan receiving minimum + extra debt payment amount.
                 </p>
                 <div style={{ overflowX: 'auto' }}>
                   <table style={styles.table}>

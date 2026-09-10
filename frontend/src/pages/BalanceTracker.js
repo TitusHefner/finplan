@@ -43,6 +43,9 @@ export default function BalanceTracker() {
   const [plaidBalances, setPlaidBalances] = useState([]);
   const [plaidHistory, setPlaidHistory] = useState([]);
   const [trackerAccountId, setTrackerAccountId] = useState(null);
+  const [includeExtraDebtPaymentAmount, setIncludeExtraDebtPaymentAmount] = useState(true);
+  const [extraDebtPaymentAmount, setExtraDebtPaymentAmount] = useState(0);
+  const [extraDebtPaymentIsManualOverride, setExtraDebtPaymentIsManualOverride] = useState(false);
   const [safetyBuffer, setSafetyBuffer] = useState(
     () => parseFloat(localStorage.getItem('safetyBuffer') ?? '500')
   );
@@ -137,6 +140,83 @@ export default function BalanceTracker() {
       .catch(() => {});
   }, []);
 
+  const fetchDebtPlanForProjection = useCallback(async () => {
+    try {
+      const [manualRes, liabilitiesRes] = await Promise.all([
+        axios.get('/api/goals/manual-debts/').catch(() => ({ data: [] })),
+        axios.get('/api/plaid/liabilities').catch(() => ({ data: { credit: [], student: [], mortgage: [] } })),
+      ]);
+
+      const manualDebts = Array.isArray(manualRes.data) ? manualRes.data : [];
+      const liabilities = liabilitiesRes.data || { credit: [], student: [], mortgage: [] };
+      const debts = [];
+
+      for (const d of manualDebts) {
+        debts.push({
+          name: d.name,
+          debt_type: d.debt_type,
+          current_balance: Math.abs(Number(d.current_balance || 0)),
+          interest_rate: Number(d.interest_rate || 0),
+          minimum_payment: d.minimum_payment_amount != null ? Number(d.minimum_payment_amount) : null,
+          institution_name: d.institution_name || '',
+          source: 'manual',
+          next_payment_due_date: d.next_payment_due_date || null,
+        });
+      }
+
+      for (const s of liabilities.student || []) {
+        debts.push({
+          name: s.name,
+          debt_type: 'student_loan',
+          current_balance: Math.abs(Number(s.current_balance || 0)),
+          interest_rate: Number(s.interest_rate_percentage || 0),
+          minimum_payment: s.minimum_payment_amount != null ? Number(s.minimum_payment_amount) : null,
+          institution_name: s.institution_name || '',
+          source: 'plaid',
+          next_payment_due_date: s.next_payment_due_date || null,
+        });
+      }
+
+      for (const c of liabilities.credit || []) {
+        debts.push({
+          name: c.name,
+          debt_type: 'credit_card',
+          current_balance: Math.abs(Number(c.current_balance || 0)),
+          interest_rate: Number(c.purchase_apr || 0),
+          minimum_payment: c.minimum_payment_amount != null ? Number(c.minimum_payment_amount) : null,
+          institution_name: c.institution_name || '',
+          source: 'plaid',
+          next_payment_due_date: c.next_payment_due_date || null,
+        });
+      }
+
+      const overrideRaw = localStorage.getItem('extraDebtPaymentAmountOverride');
+      const overrideNum = overrideRaw != null && overrideRaw !== '' ? Number(overrideRaw) : null;
+
+      const payload = {
+        debts,
+        extra_payment_budget: 0,
+        lookback_days: 120,
+        fixed_credit_card_name: 'AAdvantage',
+        fixed_credit_card_autopay: 250,
+        fixed_credit_card_extra: 750,
+        student_strategy: 'avalanche',
+        ignore_estimated_student_minimums: true,
+        graduation_date: '2026-05-15',
+        grace_period_months: 6,
+        student_extra_override: overrideNum,
+      };
+
+      const res = await axios.post('/api/goals/debt-strategy', payload);
+      const cp = res?.data?.custom_plan;
+      setExtraDebtPaymentAmount(Number(cp?.student_extra_payment_used || 0));
+      setExtraDebtPaymentIsManualOverride(Boolean(cp?.student_extra_is_manual_override));
+    } catch {
+      setExtraDebtPaymentAmount(0);
+      setExtraDebtPaymentIsManualOverride(false);
+    }
+  }, []);
+
   const handleSetTrackerAccount = (plaidAccountId) => {
     axios.post('/api/plaid/tracker-account', { plaid_account_id: plaidAccountId })
       .then(() => {
@@ -166,7 +246,8 @@ export default function BalanceTracker() {
     fetchPlaidBalances();
     fetchPlaidHistory();
     fetchTrackerAccount();
-  }, [fetchCurrent, fetchHistory, fetchPlanned, fetchPlannedIncomes, fetchPlaidBalances, fetchPlaidHistory, fetchTrackerAccount]);
+    fetchDebtPlanForProjection();
+  }, [fetchCurrent, fetchHistory, fetchPlanned, fetchPlannedIncomes, fetchPlaidBalances, fetchPlaidHistory, fetchTrackerAccount, fetchDebtPlanForProjection]);
 
   useEffect(() => {
     fetchProjection();
@@ -249,24 +330,52 @@ export default function BalanceTracker() {
       ? n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
       : '--';
 
-  const bufferBreaches = projection.filter(p => p.balance < safetyBuffer);
-  const firstBreach = bufferBreaches[0] ?? null;
-
   // Build unified chart axis: past (history) + future (projection)
   const todayStr = new Date(Date.now() - new Date().getTimezoneOffset() * 60000)
     .toISOString()
     .substring(0, 10);
+
+  const projectionAdjustment = useMemo(() => {
+    const chargeDates = new Set();
+    if (!includeExtraDebtPaymentAmount || extraDebtPaymentAmount <= 0 || projection.length === 0) {
+      return { points: projection, chargeDates };
+    }
+
+    let runningAdjustment = 0;
+    let lastChargedMonth = null;
+    const adjusted = projection.map((p) => {
+      const d = String(p.date || '');
+      const monthKey = d.substring(0, 7);
+      if (d > todayStr && monthKey !== lastChargedMonth) {
+        runningAdjustment += Number(extraDebtPaymentAmount || 0);
+        lastChargedMonth = monthKey;
+        chargeDates.add(d);
+      }
+      return {
+        ...p,
+        balance: Math.round((Number(p.balance || 0) - runningAdjustment) * 100) / 100,
+      };
+    });
+
+    return { points: adjusted, chargeDates };
+  }, [projection, includeExtraDebtPaymentAmount, extraDebtPaymentAmount, todayStr]);
+
+  const effectiveProjection = projectionAdjustment.points;
+
+  const bufferBreaches = effectiveProjection.filter(p => p.balance < safetyBuffer);
+  const firstBreach = bufferBreaches[0] ?? null;
+
   const weekAgo = new Date();
   weekAgo.setDate(weekAgo.getDate() - 7);
   const weekAgoStr = new Date(weekAgo.getTime() - weekAgo.getTimezoneOffset() * 60000)
     .toISOString()
     .substring(0, 10);
   const histMap = new Map(history.map(p => [p.date, p.balance]));
-  const projMap = new Map(projection.map(p => [p.date, p.balance]));
+  const projMap = new Map(effectiveProjection.map(p => [p.date, p.balance]));
   const plaidMap = new Map(plaidHistory.map(p => [p.date, p.balance]));
   const allDates = [...new Set([
     ...history.map(p => p.date),
-    ...projection.map(p => p.date),
+    ...effectiveProjection.map(p => p.date),
     ...plaidHistory.map(p => p.date),
   ])]
     .sort()
@@ -288,7 +397,17 @@ export default function BalanceTracker() {
   const todayMarker = allDates.map(d => d === todayStr ? (histMap.get(d) ?? projMap.get(d) ?? null) : null);
 
   // Day breakdown map for tooltip
-  const dayBreakdownMap = new Map(dayBreakdown.map(d => [d.date, d.items]));
+  const dayBreakdownMap = new Map(dayBreakdown.map(d => [d.date, [...(d.items || [])]]));
+  if (includeExtraDebtPaymentAmount && extraDebtPaymentAmount > 0) {
+    for (const d of projectionAdjustment.chargeDates) {
+      const items = dayBreakdownMap.get(d) || [];
+      items.push({
+        label: 'Extra debt payment amount',
+        amount: -Math.abs(extraDebtPaymentAmount),
+      });
+      dayBreakdownMap.set(d, items);
+    }
+  }
 
   // Planned expense markers: large red dot at the projected balance on that date
   const plannedExpenseMap = new Map(
@@ -311,6 +430,11 @@ export default function BalanceTracker() {
   );
   const plannedIncomeMarkerData = allDates.map(d => {
     if (plannedIncomeMap.has(d) && projMap.has(d)) return projMap.get(d);
+    return null;
+  });
+
+  const extraDebtPaymentMarkerData = allDates.map(d => {
+    if (projectionAdjustment.chargeDates.has(d) && projMap.has(d)) return projMap.get(d);
     return null;
   });
 
@@ -419,6 +543,18 @@ export default function BalanceTracker() {
         pointHoverRadius: 12,
         pointStyle: 'triangle',
         rotation: 0,
+        borderWidth: 0,
+        fill: false,
+        showLine: false,
+      },
+      {
+        label: '_extraDebtPaymentAmount',
+        data: extraDebtPaymentMarkerData,
+        borderColor: '#7c2d12',
+        backgroundColor: '#7c2d12',
+        pointRadius: allDates.map(d => projectionAdjustment.chargeDates.has(d) && projMap.has(d) ? 8 : 0),
+        pointHoverRadius: 10,
+        pointStyle: 'rectRot',
         borderWidth: 0,
         fill: false,
         showLine: false,
@@ -695,6 +831,21 @@ export default function BalanceTracker() {
               </div>
             )}
           </div>
+
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #e5e7eb', display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#374151', fontWeight: 600 }}>
+              <input
+                type="checkbox"
+                checked={includeExtraDebtPaymentAmount}
+                onChange={e => setIncludeExtraDebtPaymentAmount(e.target.checked)}
+              />
+              Include extra debt payment amount in projection
+            </label>
+            <span style={{ fontSize: 12, color: '#6b7280' }}>
+              Amount: <strong>{fmt(extraDebtPaymentAmount)}</strong>
+              {extraDebtPaymentIsManualOverride ? ' (manual override from Debt Command Center)' : ' (auto-calculated)'}
+            </span>
+          </div>
         </div>
 
         {allDates.length > 0 ? (
@@ -713,11 +864,11 @@ export default function BalanceTracker() {
           </p>
         )}
 
-        {allDates.length > 0 && projection.length > 0 && (() => {
-          const last = projection[projection.length - 1];
+        {allDates.length > 0 && effectiveProjection.length > 0 && (() => {
+          const last = effectiveProjection[effectiveProjection.length - 1];
           const allPoints = [...history, ...projection];
-          const low = projection.length ? projection.reduce((m, p) => p.balance < m.balance ? p : m, projection[0]) : null;
-          const negDays = projection.filter(p => p.balance < 0);
+          const low = effectiveProjection.length ? effectiveProjection.reduce((m, p) => p.balance < m.balance ? p : m, effectiveProjection[0]) : null;
+          const negDays = effectiveProjection.filter(p => p.balance < 0);
           return (
             <>
               {firstBreach && (
@@ -748,6 +899,9 @@ export default function BalanceTracker() {
                       color={last.balance >= 0 ? '#16a34a' : '#dc2626'} />
                 <Stat label="Projected Low" value={`${fmt(low.balance)} on ${low.date}`}
                       color={low.balance < safetyBuffer ? '#ea580c' : '#374151'} />
+                {includeExtraDebtPaymentAmount && extraDebtPaymentAmount > 0 && (
+                  <Stat label="Extra Debt Payment Events" value={String(projectionAdjustment.chargeDates.size)} color="#7c2d12" />
+                )}
                 {bufferBreaches.length > 0 && (
                   <Stat label="⚠ Days Below Buffer" value={String(bufferBreaches.length)} color="#ea580c" />
                 )}
