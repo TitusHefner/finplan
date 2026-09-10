@@ -251,7 +251,7 @@ export default function DebtsDashboard() {
         fixed_credit_card_extra: 750,
         student_strategy: 'avalanche',
         ignore_estimated_student_minimums: true,
-        graduation_date: '2026-05-15',
+        graduation_date: '2026-07-27',
         grace_period_months: 6,
         student_extra_override: manualExtraDebtPaymentAmount === '' ? null : Number(manualExtraDebtPaymentAmount || 0),
       };
