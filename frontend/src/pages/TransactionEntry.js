@@ -11,6 +11,7 @@ function TransactionEntry() {
   const [deletingId, setDeletingId] = useState(null);
   const [editingId, setEditingId] = useState(null);
   const [editDraft, setEditDraft] = useState({});
+  const [togglingRecurringId, setTogglingRecurringId] = useState(null);
 
   // Form state
   const [formData, setFormData] = useState({
@@ -137,6 +138,15 @@ function TransactionEntry() {
       category_id: tx.category_id ?? '',
       description: tx.description ?? '',
       amount: Math.abs(tx.amount),
+      is_recurring: tx.is_recurring ?? false,
+      recurring_frequency: tx.recurring_frequency ?? 'monthly',
+      recurring_day: tx.recurring_day ?? '',
+      recurring_start_date: tx.recurring_start_date
+        ? tx.recurring_start_date.substring(0, 10)
+        : new Date().toISOString().split('T')[0],
+      recurring_end_date: tx.recurring_end_date
+        ? tx.recurring_end_date.substring(0, 10)
+        : '',
     });
   };
 
@@ -149,6 +159,14 @@ function TransactionEntry() {
         amount: editDraft.transaction_type === 'expense' || editDraft.transaction_type === 'transfer'
           ? -Math.abs(parseFloat(editDraft.amount))
           : Math.abs(parseFloat(editDraft.amount)),
+        is_recurring: editDraft.is_recurring,
+        recurring_frequency: editDraft.is_recurring ? editDraft.recurring_frequency : null,
+        recurring_day: editDraft.is_recurring && editDraft.recurring_frequency === 'monthly' && editDraft.recurring_day !== ''
+          ? parseInt(editDraft.recurring_day) : null,
+        recurring_start_date: editDraft.is_recurring && ['weekly', 'bi-weekly'].includes(editDraft.recurring_frequency) && editDraft.recurring_start_date
+          ? new Date(editDraft.recurring_start_date).toISOString() : null,
+        recurring_end_date: editDraft.is_recurring && editDraft.recurring_end_date
+          ? new Date(editDraft.recurring_end_date).toISOString() : null,
       };
       const res = await axios.patch(`/api/transactions/${txId}`, payload);
       setTransactions(prev => prev.map(t => t.id === txId ? res.data : t));
@@ -156,6 +174,22 @@ function TransactionEntry() {
     } catch (err) {
       console.error('Save failed:', err);
       alert('Failed to save changes.');
+    }
+  };
+
+  const toggleRecurring = async (txId, currentlyRecurring) => {
+    setTogglingRecurringId(txId);
+    try {
+      const payload = currentlyRecurring
+        ? { is_recurring: false, recurring_frequency: null, recurring_day: null, recurring_start_date: null, recurring_end_date: null }
+        : { is_recurring: true, recurring_frequency: 'monthly' };
+      const res = await axios.patch(`/api/transactions/${txId}`, payload);
+      setTransactions(prev => prev.map(t => t.id === txId ? res.data : t));
+    } catch (err) {
+      console.error('Toggle recurring failed:', err);
+      alert('Failed to update recurring status.');
+    } finally {
+      setTogglingRecurringId(null);
     }
   };
 
@@ -433,7 +467,8 @@ function TransactionEntry() {
                       editDraft.transaction_type === 'income' ? c.is_income : !c.is_income
                     );
                     return (
-                      <tr key={transaction.id} style={{ borderBottom: '2px solid #3498db', background: '#eaf3fb' }}>
+                      <React.Fragment key={transaction.id}>
+                      <tr style={{ borderBottom: '1px solid #3498db', background: '#eaf3fb' }}>
                         <td style={{ padding: '10px 16px', color: '#7f8c8d', fontSize: 13 }}>
                           {new Date(transaction.transaction_date).toLocaleDateString()}
                         </td>
@@ -488,6 +523,55 @@ function TransactionEntry() {
                           >Cancel</button>
                         </td>
                       </tr>
+                      <tr key={transaction.id + '-recurring'} style={{ background: '#eaf3fb', borderBottom: '2px solid #3498db' }}>
+                        <td colSpan={7} style={{ padding: '6px 16px 10px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer', userSelect: 'none' }}>
+                              <input type="checkbox" checked={editDraft.is_recurring}
+                                onChange={e => setEditDraft(d => ({ ...d, is_recurring: e.target.checked }))} />
+                              Recurring
+                            </label>
+                            {editDraft.is_recurring && (
+                              <>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                                  Frequency
+                                  <select value={editDraft.recurring_frequency} style={{ padding: '3px 6px', borderRadius: 5, border: '1px solid #aed6f1', fontSize: 13 }}
+                                    onChange={e => setEditDraft(d => ({ ...d, recurring_frequency: e.target.value }))}>
+                                    <option value="daily">Daily</option>
+                                    <option value="weekly">Weekly</option>
+                                    <option value="bi-weekly">Bi-weekly</option>
+                                    <option value="monthly">Monthly</option>
+                                    <option value="yearly">Yearly</option>
+                                  </select>
+                                </label>
+                                {editDraft.recurring_frequency === 'monthly' && (
+                                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                                    Day of month
+                                    <input type="number" min="1" max="31" placeholder="1–31"
+                                      value={editDraft.recurring_day} style={{ width: 60, padding: '3px 6px', borderRadius: 5, border: '1px solid #aed6f1', fontSize: 13 }}
+                                      onChange={e => setEditDraft(d => ({ ...d, recurring_day: e.target.value }))} />
+                                  </label>
+                                )}
+                                {['weekly', 'bi-weekly'].includes(editDraft.recurring_frequency) && (
+                                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                                    Start date
+                                    <input type="date" value={editDraft.recurring_start_date}
+                                      style={{ padding: '3px 6px', borderRadius: 5, border: '1px solid #aed6f1', fontSize: 13 }}
+                                      onChange={e => setEditDraft(d => ({ ...d, recurring_start_date: e.target.value }))} />
+                                  </label>
+                                )}
+                                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                                  End date (optional)
+                                  <input type="date" value={editDraft.recurring_end_date}
+                                    style={{ padding: '3px 6px', borderRadius: 5, border: '1px solid #aed6f1', fontSize: 13 }}
+                                    onChange={e => setEditDraft(d => ({ ...d, recurring_end_date: e.target.value }))} />
+                                </label>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                      </React.Fragment>
                     );
                   }
 
@@ -502,7 +586,9 @@ function TransactionEntry() {
                       </td>
                       <td style={{ padding: '12px 16px' }}>
                         {transaction.description}
-                        {transaction.is_recurring && <span style={{ color: '#f39c12', marginLeft: '8px' }}>↻</span>}
+                        {transaction.is_recurring && (
+                          <span title={transaction.recurring_frequency ?? 'recurring'} style={{ color: '#f39c12', marginLeft: '6px', fontSize: 13 }}>↻</span>
+                        )}
                       </td>
                       <td style={{ padding: '12px 16px' }}>
                         {transaction.category_id ?
@@ -542,6 +628,22 @@ function TransactionEntry() {
                         </button>
                       </td>
                       <td style={{ padding: '8px 8px', textAlign: 'center', whiteSpace: 'nowrap' }}>
+                        <button
+                          onClick={() => toggleRecurring(transaction.id, transaction.is_recurring)}
+                          disabled={busy || togglingRecurringId === transaction.id}
+                          title={transaction.is_recurring ? 'Unmark as recurring' : 'Mark as recurring'}
+                          style={{
+                            fontSize: 11,
+                            padding: '3px 8px',
+                            border: '1px solid',
+                            borderColor: transaction.is_recurring ? '#f39c12' : '#d0d0d0',
+                            borderRadius: 6,
+                            cursor: 'pointer',
+                            background: transaction.is_recurring ? '#fff8ee' : 'transparent',
+                            color: transaction.is_recurring ? '#e67e22' : '#999',
+                            marginRight: 4,
+                          }}
+                        >{togglingRecurringId === transaction.id ? '…' : '↻'}</button>
                         <button
                           onClick={() => startEdit(transaction)}
                           disabled={busy}

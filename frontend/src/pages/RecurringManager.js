@@ -13,24 +13,69 @@ const FREQ_LABEL = {
 
 const TYPE_LABEL = { income: 'Income', expense: 'Expense', transfer: 'Transfer' };
 
+const EMPTY_NEW = {
+  description: '',
+  transaction_type: 'expense',
+  amount: '',
+  account_id: '',
+  category_id: '',
+  recurring_frequency: 'monthly',
+  recurring_day: '',
+  recurring_start_date: new Date().toISOString().substring(0, 10),
+  recurring_end_date: '',
+};
+
+function nextMonthlyDate(dayOfMonth) {
+  const now = new Date();
+  let year = now.getFullYear();
+  let month = now.getMonth();
+
+  const build = (y, m) => {
+    const lastDay = new Date(y, m + 1, 0).getDate();
+    const d = Math.min(dayOfMonth, lastDay);
+    return new Date(y, m, d);
+  };
+
+  let candidate = build(year, month);
+  // If today's date passed this month's recurring day, use next month.
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (candidate < today) {
+    month += 1;
+    if (month > 11) {
+      month = 0;
+      year += 1;
+    }
+    candidate = build(year, month);
+  }
+
+  return candidate;
+}
+
 export default function RecurringManager() {
   const [transactions, setTransactions] = useState([]);
   const [categories, setCategories] = useState([]);
+  const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(null); // transaction id being edited
   const [draft, setDraft] = useState({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [showAdd, setShowAdd] = useState(false);
+  const [newDraft, setNewDraft] = useState(EMPTY_NEW);
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState('');
 
   const load = useCallback(() => {
     setLoading(true);
     Promise.all([
       axios.get('/api/transactions/recurring'),
       axios.get('/api/categories/'),
+      axios.get('/api/accounts/'),
     ])
-      .then(([txRes, catRes]) => {
+      .then(([txRes, catRes, accRes]) => {
         setTransactions(txRes.data);
         setCategories(catRes.data);
+        setAccounts(accRes.data);
       })
       .catch(() => setError('Failed to load recurring transactions.'))
       .finally(() => setLoading(false));
@@ -98,6 +143,58 @@ export default function RecurringManager() {
     }
   };
 
+  const addRecurring = async () => {
+    setAdding(true);
+    setAddError('');
+    try {
+      const amount = parseFloat(newDraft.amount);
+      if (isNaN(amount) || amount <= 0) { setAddError('Amount must be a positive number.'); setAdding(false); return; }
+      if (!newDraft.description.trim()) { setAddError('Description is required.'); setAdding(false); return; }
+      if (!newDraft.account_id) { setAddError('Account is required.'); setAdding(false); return; }
+
+      let anchorDate = new Date();
+      if (['weekly', 'bi-weekly', 'yearly'].includes(newDraft.recurring_frequency) && newDraft.recurring_start_date) {
+        anchorDate = new Date(newDraft.recurring_start_date);
+      } else if (newDraft.recurring_frequency === 'monthly' && newDraft.recurring_day !== '') {
+        anchorDate = nextMonthlyDate(parseInt(newDraft.recurring_day, 10));
+      }
+
+      if (Number.isNaN(anchorDate.getTime())) {
+        setAddError('Invalid recurring start/schedule date.');
+        setAdding(false);
+        return;
+      }
+
+      const payload = {
+        description: newDraft.description.trim(),
+        amount: newDraft.transaction_type === 'expense' ? -Math.abs(amount) : Math.abs(amount),
+        transaction_type: newDraft.transaction_type,
+        account_id: parseInt(newDraft.account_id),
+        category_id: newDraft.category_id !== '' ? parseInt(newDraft.category_id) : null,
+        transaction_date: anchorDate.toISOString(),
+        is_recurring: true,
+        recurring_frequency: newDraft.recurring_frequency,
+        recurring_day: newDraft.recurring_frequency === 'monthly' && newDraft.recurring_day !== ''
+          ? parseInt(newDraft.recurring_day) : null,
+        recurring_start_date: ['weekly', 'bi-weekly'].includes(newDraft.recurring_frequency) && newDraft.recurring_start_date
+          ? new Date(newDraft.recurring_start_date).toISOString() : null,
+        recurring_end_date: newDraft.recurring_end_date
+          ? new Date(newDraft.recurring_end_date).toISOString() : null,
+        notes: null,
+        tags: null,
+      };
+
+      await axios.post('/api/transactions/', payload);
+      setNewDraft(EMPTY_NEW);
+      setShowAdd(false);
+      load();
+    } catch {
+      setAddError('Failed to create recurring transaction.');
+    } finally {
+      setAdding(false);
+    }
+  };
+
   const grouped = FREQUENCIES.reduce((acc, f) => {
     acc[f] = transactions.filter(t => t.recurring_frequency === f);
     return acc;
@@ -108,10 +205,98 @@ export default function RecurringManager() {
 
   return (
     <div style={{ padding: '24px', maxWidth: 900, margin: '0 auto' }}>
-      <h1 style={{ marginBottom: 4 }}>🔁 Recurring Transactions</h1>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+        <h1 style={{ margin: 0 }}>🔁 Recurring Transactions</h1>
+        <button
+          onClick={() => { setShowAdd(s => !s); setAddError(''); }}
+          style={{ padding: '8px 18px', borderRadius: 6, border: 'none', background: '#2ecc71', color: '#fff', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}
+        >
+          {showAdd ? 'Cancel' : '+ Add Recurring'}
+        </button>
+      </div>
       <p style={{ color: '#888', marginBottom: 24 }}>
         Adjust amounts, descriptions, and schedule for your recurring income and expenses.
       </p>
+
+      {showAdd && (
+        <div style={{ background: '#f9fffe', border: '1px solid #b2dfdb', borderRadius: 8, padding: 20, marginBottom: 24 }}>
+          <h3 style={{ margin: '0 0 16px', fontSize: 15, color: '#1a7a40' }}>New Recurring Transaction</h3>
+          {addError && (
+            <div style={{ background: '#fee', border: '1px solid #f88', borderRadius: 6, padding: '8px 12px', marginBottom: 12, color: '#c00', fontSize: 13 }}>
+              {addError}
+            </div>
+          )}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'flex-end' }}>
+            <label style={lbl}>
+              Description
+              <input style={{ ...inp, minWidth: 180 }} value={newDraft.description}
+                onChange={e => setNewDraft(d => ({ ...d, description: e.target.value }))} placeholder="e.g. Netflix" />
+            </label>
+            <label style={lbl}>
+              Type
+              <select style={inp} value={newDraft.transaction_type}
+                onChange={e => setNewDraft(d => ({ ...d, transaction_type: e.target.value, category_id: '' }))}>
+                <option value="expense">Expense</option>
+                <option value="income">Income</option>
+                <option value="transfer">Transfer</option>
+              </select>
+            </label>
+            <label style={lbl}>
+              Amount ($)
+              <input style={{ ...inp, width: 100 }} type="number" min="0.01" step="0.01" value={newDraft.amount}
+                onChange={e => setNewDraft(d => ({ ...d, amount: e.target.value }))} placeholder="0.00" />
+            </label>
+            <label style={lbl}>
+              Account
+              <select style={inp} value={newDraft.account_id}
+                onChange={e => setNewDraft(d => ({ ...d, account_id: e.target.value }))}>
+                <option value="">— Select —</option>
+                {accounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            </label>
+            <label style={lbl}>
+              Category
+              <select style={inp} value={newDraft.category_id}
+                onChange={e => setNewDraft(d => ({ ...d, category_id: e.target.value }))}>
+                <option value="">— None —</option>
+                {categories
+                  .filter(c => newDraft.transaction_type === 'income' ? c.is_income : !c.is_income)
+                  .map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </label>
+            <label style={lbl}>
+              Frequency
+              <select style={inp} value={newDraft.recurring_frequency}
+                onChange={e => setNewDraft(d => ({ ...d, recurring_frequency: e.target.value }))}>
+                {FREQUENCIES.map(f => <option key={f} value={f}>{FREQ_LABEL[f]}</option>)}
+              </select>
+            </label>
+            {newDraft.recurring_frequency === 'monthly' && (
+              <label style={lbl}>
+                Day of Month
+                <input style={{ ...inp, width: 80 }} type="number" min="1" max="31" value={newDraft.recurring_day}
+                  onChange={e => setNewDraft(d => ({ ...d, recurring_day: e.target.value }))} placeholder="e.g. 15" />
+              </label>
+            )}
+            {['weekly', 'bi-weekly'].includes(newDraft.recurring_frequency) && (
+              <label style={lbl}>
+                Start Date
+                <input style={inp} type="date" value={newDraft.recurring_start_date}
+                  onChange={e => setNewDraft(d => ({ ...d, recurring_start_date: e.target.value }))} />
+              </label>
+            )}
+            <label style={lbl}>
+              End Date (optional)
+              <input style={inp} type="date" value={newDraft.recurring_end_date}
+                onChange={e => setNewDraft(d => ({ ...d, recurring_end_date: e.target.value }))} />
+            </label>
+            <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+              <button onClick={addRecurring} disabled={adding} style={btnSave}>{adding ? 'Saving…' : 'Add'}</button>
+              <button onClick={() => { setShowAdd(false); setNewDraft(EMPTY_NEW); setAddError(''); }} style={btnCancel}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div style={{ background: '#fee', border: '1px solid #f88', borderRadius: 6, padding: '10px 14px', marginBottom: 16, color: '#c00' }}>
@@ -125,7 +310,7 @@ export default function RecurringManager() {
         <div style={{ textAlign: 'center', padding: 48, color: '#888' }}>
           <div style={{ fontSize: 48, marginBottom: 12 }}>🔁</div>
           <p>No recurring transactions yet.</p>
-          <p>Flag a transaction as recurring in the Transactions or Mobile page.</p>
+          <p>Use <strong>+ Add Recurring</strong> above, or flag a transaction as recurring in the Transactions page.</p>
         </div>
       ) : (
         <>
