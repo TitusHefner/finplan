@@ -132,9 +132,10 @@ def _get_plaid_client():
             ),
         )
 
+    dev_env = getattr(plaid.Environment, "Development", plaid.Environment.Sandbox)
     env_map = {
         "sandbox":     plaid.Environment.Sandbox,
-        "development": plaid.Environment.Sandbox,
+        "development": dev_env,
         "production":  plaid.Environment.Production,
     }
     configuration = Configuration(
@@ -224,13 +225,13 @@ def get_plaid_balances(db: Session = Depends(database.get_db)):
 
                 # If this is the configured tracker account, write a fresh BalanceSnapshot
                 # so the balance tracker reflects the live bank balance.
-                # Timestamp is utcnow() so only transactions entered AFTER this moment
-                # are layered on top — transactions already reflected in the Plaid balance
-                # have transaction_date <= now and are not double-counted.
+                # Use the current timestamp (not start-of-day) so this live anchor is always
+                # the most recent snapshot and won't be superseded by an older manual value.
                 if tracker_account_id and plaid_acct_id == tracker_account_id and current is not None:
+                    snapshot_timestamp = datetime.utcnow()
                     balance_snap = models.BalanceSnapshot(
                         amount=current,
-                        snapshot_date=datetime.utcnow(),
+                        snapshot_date=snapshot_timestamp,
                     )
                     db.add(balance_snap)
 
@@ -264,99 +265,59 @@ def get_plaid_balances(db: Session = Depends(database.get_db)):
 @router.get("/balance-history")
 def get_plaid_balance_history(db: Session = Depends(database.get_db)):
     """
-    Returns a reconstructed daily balance history by:
-    1. Using the sum of the most-recent Plaid account snapshots as today's anchor.
-    2. Walking backward using all Plaid-imported transactions to infer prior-day balances.
-    3. Optionally anchoring at any stored intermediate snapshots to correct drift.
+    Return a daily Plaid balance series derived from captured /accounts/get snapshots.
 
-    Plaid does not expose a historical balance API, so this is the best reconstruction
-    available from /accounts/get (free) plus transaction data.
+    If a tracker account is configured, the history is scoped to that single Plaid
+    account so the chart aligns with the selected balance source.
+
+    We forward-fill between capture days to produce a continuous line without
+    transaction-based drift.
     """
-    from collections import defaultdict
-    from sqlalchemy import func
+    tracker_setting = db.query(models.AppSettings).filter(
+        models.AppSettings.key == _TRACKER_ACCOUNT_KEY
+    ).first()
+    tracker_account_id = tracker_setting.value if tracker_setting else None
 
-    # Sum current balance across the most-recent snapshot for each account
-    subq = (
-        db.query(
-            models.PlaidBalanceSnapshot.plaid_account_id,
-            func.max(models.PlaidBalanceSnapshot.captured_at).label("latest"),
-        )
-        .group_by(models.PlaidBalanceSnapshot.plaid_account_id)
-        .subquery()
-    )
-    latest_snaps = (
-        db.query(models.PlaidBalanceSnapshot)
-        .join(
-            subq,
-            (models.PlaidBalanceSnapshot.plaid_account_id == subq.c.plaid_account_id)
-            & (models.PlaidBalanceSnapshot.captured_at == subq.c.latest),
-        )
-        .all()
-    )
-    if not latest_snaps:
+    snaps_q = db.query(models.PlaidBalanceSnapshot)
+    if tracker_account_id:
+        snaps_q = snaps_q.filter(models.PlaidBalanceSnapshot.plaid_account_id == tracker_account_id)
+
+    snaps = snaps_q.order_by(models.PlaidBalanceSnapshot.captured_at.asc()).all()
+    if not snaps:
         return []
 
-    anchor_total = sum(s.current or 0.0 for s in latest_snaps)
+    # Keep the latest snapshot per account per day.
+    by_day_account: dict[str, dict[str, tuple[datetime, float]]] = {}
+    for s in snaps:
+        day_key = s.captured_at.strftime("%Y-%m-%d")
+        acct_key = s.plaid_account_id or ""
+        if day_key not in by_day_account:
+            by_day_account[day_key] = {}
+        prev = by_day_account[day_key].get(acct_key)
+        if prev is None or s.captured_at > prev[0]:
+            by_day_account[day_key][acct_key] = (s.captured_at, float(s.current or 0.0))
 
-    # Find oldest snapshot to determine lookback range
-    oldest = (
-        db.query(models.PlaidBalanceSnapshot)
-        .order_by(models.PlaidBalanceSnapshot.captured_at.asc())
-        .first()
-    )
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    earliest = oldest.captured_at.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    # Collect all Plaid-imported transactions in range for walk-back
-    plaid_txns = (
-        db.query(models.Transaction)
-        .filter(
-            models.Transaction.plaid_transaction_id.isnot(None),
-            models.Transaction.transaction_date >= earliest,
-            models.Transaction.transaction_type.in_([
-                models.TransactionType.INCOME,
-                models.TransactionType.EXPENSE,
-            ]),
-        )
-        .all()
-    )
-
-    daily_net: dict[str, float] = defaultdict(float)
-    for tx in plaid_txns:
-        d = tx.transaction_date.strftime("%Y-%m-%d")
-        if tx.transaction_type == models.TransactionType.INCOME:
-            daily_net[d] += abs(tx.amount)
-        else:
-            daily_net[d] -= abs(tx.amount)
-
-    # Build per-day aggregate snapshots so we can re-anchor on days with real data
-    # {date_str: total_current} — sum across all accounts for that day
-    daily_snap_totals: dict[str, dict[str, float]] = defaultdict(dict)
-    all_snaps = db.query(models.PlaidBalanceSnapshot).all()
-    for s in all_snaps:
-        dk = s.captured_at.strftime("%Y-%m-%d")
-        acct = s.plaid_account_id
-        daily_snap_totals[dk][acct] = s.current or 0.0
-    # Sum per day (use the most recent snapshot per account per day)
-    daily_snap_sum: dict[str, float] = {
-        dk: sum(accts.values()) for dk, accts in daily_snap_totals.items()
+    # Collapse each day to a total (single account if tracker selected; otherwise sum accounts).
+    day_totals: dict[str, float] = {
+        day: sum(v[1] for v in acct_map.values())
+        for day, acct_map in by_day_account.items()
     }
 
-    # Walk backward from today's anchor
-    result = []
-    bal = anchor_total
-    d = today
-    while d >= earliest:
-        date_key = d.strftime("%Y-%m-%d")
-        # If we stored a real snapshot on this day, re-anchor to correct drift
-        if date_key in daily_snap_sum and date_key != today.strftime("%Y-%m-%d"):
-            bal = daily_snap_sum[date_key]
-        result.append({"date": date_key, "balance": round(bal, 2)})
-        # Reverse-apply this day's net to get the balance at end of previous day
-        bal -= daily_net.get(date_key, 0.0)
-        d -= timedelta(days=1)
+    start_day = snaps[0].captured_at.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    result.reverse()
+    # Forward-fill to produce a continuous daily line.
+    result = []
+    running = None
+    d = start_day
+    while d <= end_day:
+        key = d.strftime("%Y-%m-%d")
+        if key in day_totals:
+            running = day_totals[key]
+        if running is not None:
+            result.append({"date": key, "balance": round(running, 2)})
+        d += timedelta(days=1)
+
     return result
 
 
@@ -412,6 +373,7 @@ def create_link_token():
 
     request_kwargs = dict(
         products=[Products("transactions")],
+        optional_products=[Products("liabilities")],
         client_name="SmartBudget",
         country_codes=[CountryCode("US")],
         language="en",
@@ -466,15 +428,32 @@ def exchange_public_token(
         .filter(models.PlaidItem.item_id == item_id)
         .first()
     )
+
+    # Auto-detect whether all accounts in this Item are liability (credit/loan) type.
+    # We call accounts/get immediately after exchange so we can tag the item correctly.
+    _LIABILITY_ACCOUNT_TYPES = {"credit", "loan"}
+    is_liability = False
+    try:
+        from plaid.model.accounts_get_request import AccountsGetRequest as _AGR
+        _accts_resp = client.accounts_get(_AGR(access_token=access_token))
+        _acct_types = {str(a.get("type", "")).lower() for a in _accts_resp["accounts"]}
+        # Mark as liability only if EVERY account is credit or loan (not mixed with depository)
+        if _acct_types and _acct_types.issubset(_LIABILITY_ACCOUNT_TYPES):
+            is_liability = True
+    except Exception:
+        pass  # If detection fails, default to False (safe — shows in balance tracker)
+
     if existing:
         item = existing
         item.access_token = access_token
+        item.is_liability = is_liability
     else:
         item = models.PlaidItem(
             item_id=item_id,
             access_token=access_token,
             institution_name=payload.institution_name,
             account_id=payload.account_id,
+            is_liability=is_liability,
         )
         db.add(item)
         db.commit()
@@ -637,6 +616,31 @@ def _sync_transactions(
                 )
                 response = client.transactions_sync(request)
 
+                # ── Pre-scan removed list to preserve user-set flags ───
+                # When a pending transaction posts, Plaid puts the pending ID in
+                # "removed" and the permanent ID in "added". We save any user flags
+                # (is_recurring, confirmed category) keyed by (amount, date) so we
+                # can restore them onto the newly-added posted transaction.
+                _pending_flags: dict = {}
+                for _pt in response.get("removed", []):
+                    _tx = (
+                        db.query(models.Transaction)
+                        .filter(models.Transaction.plaid_transaction_id == _pt["transaction_id"])
+                        .first()
+                    )
+                    if _tx and (_tx.is_recurring or _tx.user_confirmed_category):
+                        _d = _tx.transaction_date.strftime("%Y-%m-%d") if _tx.transaction_date else ""
+                        _key = (round(_tx.amount, 2), _d)
+                        _pending_flags[_key] = {
+                            "is_recurring": _tx.is_recurring,
+                            "recurring_frequency": _tx.recurring_frequency,
+                            "recurring_day": _tx.recurring_day,
+                            "recurring_start_date": _tx.recurring_start_date,
+                            "recurring_end_date": _tx.recurring_end_date,
+                            "category_id": _tx.category_id,
+                            "user_confirmed_category": _tx.user_confirmed_category,
+                        }
+
                 # ── Added ──────────────────────────────────────────────
                 for pt in response["added"]:
                     existing = (
@@ -697,6 +701,21 @@ def _sync_transactions(
                         ai_categorized=True,
                         user_confirmed_category=False,
                     )
+
+                    # Restore user flags if this posted tx replaces a pending one
+                    _flag_key = (round(amount, 2), tx_date.strftime("%Y-%m-%d"))
+                    if _flag_key in _pending_flags:
+                        _flags = _pending_flags.pop(_flag_key)
+                        tx.is_recurring = _flags["is_recurring"]
+                        tx.recurring_frequency = _flags["recurring_frequency"]
+                        tx.recurring_day = _flags["recurring_day"]
+                        tx.recurring_start_date = _flags["recurring_start_date"]
+                        tx.recurring_end_date = _flags["recurring_end_date"]
+                        if _flags["category_id"]:
+                            tx.category_id = _flags["category_id"]
+                        if _flags["user_confirmed_category"]:
+                            tx.user_confirmed_category = True
+
                     db.add(tx)
                     added_count += 1
                     if cat_id:
@@ -785,3 +804,183 @@ def _sync_transactions(
                 categorized=categorized_count,
                 note="Plaid data changed during sync. Click Sync again to fetch remaining transactions.",
             )
+
+
+# -- Liabilities ------------------------------------------------------------
+
+@router.get("/liabilities")
+def get_liabilities(db: Session = Depends(database.get_db)):
+    """
+    Fetch detailed liability info for all linked Items using /liabilities/get.
+    Requires the 'liabilities' product to have been requested at link time.
+    Returns enriched credit card and student loan data including APR,
+    minimum payment, due date, last payment, and past-due amounts.
+    """
+    from plaid.model.liabilities_get_request import LiabilitiesGetRequest
+
+    client = _get_plaid_client()
+    items = db.query(models.PlaidItem).all()
+    if not items:
+        return {"credit": [], "student": [], "mortgage": []}
+
+    all_credit = []
+    all_student = []
+    all_mortgage = []
+
+    for item in items:
+        try:
+            response = client.liabilities_get(
+                LiabilitiesGetRequest(access_token=item.access_token)
+            )
+            liabilities = response.get("liabilities", {})
+            accounts_by_id = {a["account_id"]: a for a in response.get("accounts", [])}
+
+            # ── Credit cards ──────────────────────────────────────────────
+            for cc in (liabilities.get("credit") or []):
+                acct = accounts_by_id.get(cc.get("account_id"), {})
+                balances = acct.get("balances", {})
+                aprs = []
+                for apr in (cc.get("aprs") or []):
+                    aprs.append({
+                        "type": str(apr.get("apr_type", "")),
+                        "rate": apr.get("apr_percentage"),
+                    })
+                all_credit.append({
+                    "account_id": cc.get("account_id"),
+                    "name": acct.get("name"),
+                    "official_name": acct.get("official_name"),
+                    "institution_name": item.institution_name,
+                    "subtype": str(acct.get("subtype", "")),
+                    "current_balance": balances.get("current"),
+                    "credit_limit": balances.get("limit"),
+                    "available": balances.get("available"),
+                    "currency": balances.get("iso_currency_code") or "USD",
+                    "last_payment_amount": cc.get("last_payment_amount"),
+                    "last_payment_date": str(cc.get("last_payment_date") or ""),
+                    "last_statement_balance": cc.get("last_statement_balance"),
+                    "last_statement_issue_date": str(cc.get("last_statement_issue_date") or ""),
+                    "minimum_payment_amount": cc.get("minimum_payment_amount"),
+                    "next_payment_due_date": str(cc.get("next_payment_due_date") or ""),
+                    "is_overdue": cc.get("is_overdue", False),
+                    "aprs": aprs,
+                    "purchase_apr": next((a["rate"] for a in aprs if "purchase" in a["type"].lower()), None),
+                })
+
+            # ── Student loans ─────────────────────────────────────────────
+            for sl in (liabilities.get("student") or []):
+                acct = accounts_by_id.get(sl.get("account_id"), {})
+                balances = acct.get("balances", {})
+                all_student.append({
+                    "account_id": sl.get("account_id"),
+                    "name": acct.get("name"),
+                    "institution_name": item.institution_name,
+                    "servicer_address": sl.get("servicer_address"),
+                    "current_balance": balances.get("current"),
+                    "currency": balances.get("iso_currency_code") or "USD",
+                    "interest_rate_percentage": sl.get("interest_rate_percentage"),
+                    "minimum_payment_amount": sl.get("minimum_payment_amount"),
+                    "next_payment_due_date": str(sl.get("next_payment_due_date") or ""),
+                    "origination_principal_amount": sl.get("origination_principal_amount"),
+                    "outstanding_interest_amount": sl.get("outstanding_interest_amount"),
+                    "last_payment_amount": sl.get("last_payment_amount"),
+                    "last_payment_date": str(sl.get("last_payment_date") or ""),
+                    "is_overdue": sl.get("is_overdue", False),
+                    "repayment_plan": str(sl.get("repayment_plan", {}).get("type", "") if sl.get("repayment_plan") else ""),
+                    "expected_payoff_date": str(sl.get("expected_payoff_date") or ""),
+                })
+
+            # ── Mortgages ─────────────────────────────────────────────────
+            for mg in (liabilities.get("mortgage") or []):
+                acct = accounts_by_id.get(mg.get("account_id"), {})
+                balances = acct.get("balances", {})
+                all_mortgage.append({
+                    "account_id": mg.get("account_id"),
+                    "name": acct.get("name"),
+                    "institution_name": item.institution_name,
+                    "current_balance": balances.get("current"),
+                    "currency": balances.get("iso_currency_code") or "USD",
+                    "interest_rate": mg.get("interest_rate", {}).get("percentage") if mg.get("interest_rate") else None,
+                    "last_payment_amount": mg.get("last_payment_amount"),
+                    "last_payment_date": str(mg.get("last_payment_date") or ""),
+                    "minimum_monthly_payment": mg.get("minimum_monthly_payment"),
+                    "next_monthly_payment": mg.get("next_monthly_payment"),
+                    "next_payment_due_date": str(mg.get("next_payment_due_date") or ""),
+                    "origination_principal_amount": mg.get("origination_principal_amount"),
+                    "maturity_date": str(mg.get("maturity_date") or ""),
+                    "is_overdue": mg.get("is_overdue", False),
+                    "property_address": mg.get("property_address"),
+                })
+
+        except Exception as exc:
+            # liabilities product not enabled for this item — skip gracefully
+            err_str = str(exc)
+            if "PRODUCTS_NOT_SUPPORTED" in err_str or "INVALID_PRODUCT" in err_str or "liabilities" in err_str.lower():
+                continue
+            raise HTTPException(status_code=502, detail=f"Plaid liabilities error: {err_str}")
+
+    return {"credit": all_credit, "student": all_student, "mortgage": all_mortgage}
+
+
+# -- Debt Accounts ----------------------------------------------------------
+
+@router.get("/debt-accounts")
+def get_debt_accounts(db: Session = Depends(database.get_db)):
+    """
+    Return only credit card and loan accounts from Plaid.
+    Used by the Financial Planning page to surface debt for goal creation.
+    Each account includes: name, type, subtype, current balance (amount owed),
+    credit limit (for cards), utilization %, and institution name.
+    """
+    from plaid.model.accounts_get_request import AccountsGetRequest
+
+    DEBT_TYPES = {"credit", "loan"}
+    DEBT_SUBTYPES = {
+        "credit card", "paypal", "line of credit",
+        "auto", "business", "commercial", "construction",
+        "consumer", "home equity", "loan", "mortgage",
+        "overdraft", "student", "other",
+    }
+
+    client = _get_plaid_client()
+    items = db.query(models.PlaidItem).all()
+    if not items:
+        return []
+
+    results = []
+    for item in items:
+        try:
+            response = client.accounts_get(
+                AccountsGetRequest(access_token=item.access_token)
+            )
+            for acct in response["accounts"]:
+                acct_type = str(acct.get("type", "")).lower()
+                acct_subtype = str(acct.get("subtype", "")).lower()
+                if acct_type not in DEBT_TYPES and acct_subtype not in DEBT_SUBTYPES:
+                    continue
+
+                balances = acct.get("balances", {})
+                current = balances.get("current") or 0.0
+                limit = balances.get("limit")
+                utilization = None
+                if limit and limit > 0:
+                    utilization = round((current / limit) * 100, 1)
+
+                results.append({
+                    "account_id": acct.get("account_id"),
+                    "name": acct.get("name"),
+                    "official_name": acct.get("official_name"),
+                    "type": acct_type,
+                    "subtype": acct_subtype,
+                    "institution_name": item.institution_name,
+                    "current_balance": current,
+                    "credit_limit": limit,
+                    "utilization_pct": utilization,
+                    "currency": balances.get("iso_currency_code") or "USD",
+                })
+        except Exception as exc:
+            results.append({
+                "institution_name": item.institution_name,
+                "error": str(exc),
+            })
+
+    return results

@@ -253,7 +253,14 @@ export default function BalanceTracker() {
   const firstBreach = bufferBreaches[0] ?? null;
 
   // Build unified chart axis: past (history) + future (projection)
-  const todayStr = new Date().toISOString().substring(0, 10);
+  const todayStr = new Date(Date.now() - new Date().getTimezoneOffset() * 60000)
+    .toISOString()
+    .substring(0, 10);
+  const weekAgo = new Date();
+  weekAgo.setDate(weekAgo.getDate() - 7);
+  const weekAgoStr = new Date(weekAgo.getTime() - weekAgo.getTimezoneOffset() * 60000)
+    .toISOString()
+    .substring(0, 10);
   const histMap = new Map(history.map(p => [p.date, p.balance]));
   const projMap = new Map(projection.map(p => [p.date, p.balance]));
   const plaidMap = new Map(plaidHistory.map(p => [p.date, p.balance]));
@@ -261,7 +268,9 @@ export default function BalanceTracker() {
     ...history.map(p => p.date),
     ...projection.map(p => p.date),
     ...plaidHistory.map(p => p.date),
-  ])].sort();
+  ])]
+    .sort()
+    .filter(d => d >= weekAgoStr);
 
   // Actual line: historical values only (null in future so line stops at today)
   const actualData = allDates.map(d => histMap.has(d) ? histMap.get(d) : null);

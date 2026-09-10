@@ -9,6 +9,23 @@ from app import database, models
 
 router = APIRouter()
 
+def _liability_account_ids(db: Session) -> list[int]:
+    """
+    Return the internal account_id values used by liability PlaidItems
+    (credit cards, loans).  Transactions tagged with these account_ids
+    should be excluded from the checking-account balance tracker.
+    Only non-NULL account_ids are returned.
+    """
+    rows = (
+        db.query(models.PlaidItem.account_id)
+        .filter(
+            models.PlaidItem.is_liability == True,
+            models.PlaidItem.account_id.isnot(None),
+        )
+        .all()
+    )
+    return [r.account_id for r in rows]
+
 
 class PlannedExpenseCreate(BaseModel):
     description: str
@@ -108,7 +125,7 @@ def _month_start_end(year: int, month: int):
 
 def _months_back(n: int) -> list[tuple[int, int]]:
     """Return the last n (year, month) pairs going backwards from the previous month."""
-    today = datetime.utcnow()
+    today = datetime.now()
     result = []
     year, month = today.year, today.month
     for _ in range(n):
@@ -153,7 +170,7 @@ def _category_spending_for_range(db: Session, category_id: int, start: datetime,
 
 
 def _budget_for_category(db: Session, category_id: int) -> Optional[float]:
-    today = datetime.utcnow()
+    today = datetime.now()
     budget = (
         db.query(models.Budget)
         .filter(
@@ -392,6 +409,24 @@ def _occurrences_in_range(
     return occurrences
 
 
+def _legacy_income_occurrences(
+    income: models.Income,
+    start: datetime,
+    end: datetime,
+) -> list[datetime]:
+    """Return scheduled occurrences for a legacy recurring income record."""
+    if not income.frequency:
+        return []
+    anchor = income.start_date or income.date
+    return _occurrences_in_range(
+        income.frequency,
+        income.recurring_day,
+        start,
+        end,
+        start_date=anchor,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -401,7 +436,7 @@ def set_balance_snapshot(payload: SnapshotCreate, db: Session = Depends(database
     """Set or update the user's starting balance."""
     snapshot = models.BalanceSnapshot(
         amount=payload.amount,
-        snapshot_date=payload.snapshot_date or datetime.utcnow(),
+        snapshot_date=payload.snapshot_date or datetime.now(),
     )
     db.add(snapshot)
     db.commit()
@@ -417,32 +452,36 @@ def get_current_balance(db: Session = Depends(database.get_db)):
         return CurrentBalanceResponse(
             current_balance=0.0,
             snapshot_amount=0.0,
-            snapshot_date=datetime.utcnow(),
+            snapshot_date=datetime.now(),
             total_income_since=0.0,
             total_expenses_since=0.0,
         )
 
     since = snapshot.snapshot_date
+    now = datetime.now()
+    liability_ids = _liability_account_ids(db)
 
-    income_txs = (
-        db.query(models.Transaction)
-        .filter(
-            models.Transaction.transaction_type == models.TransactionType.INCOME,
-            models.Transaction.transaction_date > since,
-        )
-        .all()
+    base_q = db.query(models.Transaction).filter(
+        models.Transaction.transaction_date >= since,
+        (models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)) if liability_ids else True,
     )
-    expense_txs = (
-        db.query(models.Transaction)
-        .filter(
-            models.Transaction.transaction_type == models.TransactionType.EXPENSE,
-            models.Transaction.transaction_date > since,
-        )
-        .all()
-    )
+    income_txs = base_q.filter(
+        models.Transaction.transaction_type == models.TransactionType.INCOME,
+    ).all()
+    expense_txs = base_q.filter(
+        models.Transaction.transaction_type == models.TransactionType.EXPENSE,
+    ).all()
 
     total_income = sum(abs(t.amount) for t in income_txs)
     total_expenses = sum(abs(t.amount) for t in expense_txs)
+
+    legacy_income_total = 0.0
+    for income in db.query(models.Income).all():
+        for occ in _legacy_income_occurrences(income, since, now):
+            if occ >= since and occ <= now:
+                legacy_income_total += abs(income.amount)
+
+    total_income += legacy_income_total
     current = snapshot.amount + total_income - total_expenses
 
     return CurrentBalanceResponse(
@@ -457,53 +496,81 @@ def get_current_balance(db: Session = Depends(database.get_db)):
 @router.get("/history", response_model=List[ProjectionPoint])
 def get_balance_history(db: Session = Depends(database.get_db)):
     """
-    Return day-by-day actual balance from the snapshot date through today.
-    Balance is computed forward from the snapshot anchor using actual transactions.
+    Return day-by-day actual balance from the earliest available data through today.
+    Reconstructs historical balance by:
+    1. Using the most recent BalanceSnapshot as today's anchor.
+    2. Walking backward using all transactions to infer prior-day balances.
+    3. Includes both Plaid and manually-entered transactions.
     """
+    from collections import defaultdict
+    
     snapshot = _get_latest_snapshot(db)
     if not snapshot:
         return []
 
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    snapshot_day = snapshot.snapshot_date.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    # Fetch transactions strictly after the snapshot timestamp through today
-    txns = (
-        db.query(models.Transaction)
-        .filter(
-            models.Transaction.transaction_date > snapshot.snapshot_date,
-            models.Transaction.transaction_date < today + timedelta(days=1),
-            models.Transaction.transaction_type.in_([
-                models.TransactionType.INCOME,
-                models.TransactionType.EXPENSE,
-            ]),
-        )
-        .all()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Determine lookback range: show only last 7 days of history
+    earliest = today - timedelta(days=7)
+    
+    # Exclude credit-card / loan / investment accounts from balance maths
+    liability_ids = _liability_account_ids(db)
+    
+    # Collect all transactions in range
+    txns_q = db.query(models.Transaction).filter(
+        models.Transaction.transaction_date >= earliest,
+        models.Transaction.transaction_type.in_([
+            models.TransactionType.INCOME,
+            models.TransactionType.EXPENSE,
+        ]),
     )
+    if liability_ids:
+        txns_q = txns_q.filter((models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)))
+    txns = txns_q.all()
 
-    from collections import defaultdict
-    daily: dict[str, float] = defaultdict(float)
+    daily_net: dict[str, float] = defaultdict(float)
     for tx in txns:
         d = tx.transaction_date.strftime("%Y-%m-%d")
-        if _enum_str(tx.transaction_type) == "income":
-            daily[d] += abs(tx.amount)
+        if tx.transaction_type == models.TransactionType.INCOME:
+            daily_net[d] += abs(tx.amount)
         else:
-            daily[d] -= abs(tx.amount)
+            daily_net[d] -= abs(tx.amount)
 
-    snapshot_key = snapshot_day.strftime("%Y-%m-%d")
+    # Include legacy income occurrences
+    for income in db.query(models.Income).all():
+        for occ in _legacy_income_occurrences(income, earliest, today + timedelta(days=1)):
+            if occ >= earliest and occ <= today + timedelta(days=1):
+                d = occ.strftime("%Y-%m-%d")
+                daily_net[d] += abs(income.amount)
 
-    # --- Forward walk: snapshot_day through today ---
-    forward_entries: list[tuple[str, float]] = []
+    # Walk backward from snapshot date to earliest
+    result = []
+    bal = snapshot.amount
+    snapshot_day = snapshot.snapshot_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    bal_backwards = bal
+    d_back = snapshot_day
+    backwards_entries = []
+    while d_back >= earliest:
+        date_key = d_back.strftime("%Y-%m-%d")
+        backwards_entries.append(ProjectionPoint(date=date_key, balance=round(bal_backwards, 2)))
+        # Reverse-apply this day's net to get the balance at end of previous day
+        bal_backwards -= daily_net.get(date_key, 0.0)
+        d_back -= timedelta(days=1)
+    
+    # Reverse to get chronological order (earliest to snapshot date)
+    backwards_entries.reverse()
+    result.extend(backwards_entries)
+    
+    # Walk forward from day after snapshot through today
     bal = snapshot.amount
     d = snapshot_day + timedelta(days=1)
     while d <= today:
-        key = d.strftime("%Y-%m-%d")
-        bal += daily.get(key, 0.0)
-        forward_entries.append((key, round(bal, 2)))
+        date_key = d.strftime("%Y-%m-%d")
+        bal += daily_net.get(date_key, 0.0)
+        result.append(ProjectionPoint(date=date_key, balance=round(bal, 2)))
         d += timedelta(days=1)
 
-    result = [ProjectionPoint(date=snapshot_key, balance=snapshot.amount)]
-    result.extend(ProjectionPoint(date=dk, balance=b) for dk, b in forward_entries)
     return result
 
 
@@ -527,21 +594,36 @@ def get_balance_projection(
     baseline = snapshot.amount if snapshot else 0.0
 
     # Calculate current balance first using actual transactions
+    # Exclude credit-card / loan / investment accounts from balance maths.
+    # Use >= to include transactions on the snapshot date.
+    liability_ids = _liability_account_ids(db)
     if snapshot:
         since = snapshot.snapshot_date
-        income_txs = db.query(models.Transaction).filter(
+        txn_base = db.query(models.Transaction).filter(
+            models.Transaction.transaction_date >= since,
+        )
+        if liability_ids:
+            txn_base = txn_base.filter((models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)))
+        income_txs = txn_base.filter(
             models.Transaction.transaction_type == models.TransactionType.INCOME,
-            models.Transaction.transaction_date > since,
         ).all()
-        expense_txs = db.query(models.Transaction).filter(
+        expense_txs = txn_base.filter(
             models.Transaction.transaction_type == models.TransactionType.EXPENSE,
-            models.Transaction.transaction_date > since,
         ).all()
         baseline = (
             snapshot.amount
             + sum(abs(t.amount) for t in income_txs)
             - sum(abs(t.amount) for t in expense_txs)
         )
+
+        legacy_income_total = 0.0
+        now = datetime.now()
+        for income in db.query(models.Income).all():
+            for occ in _legacy_income_occurrences(income, since, now):
+                if occ > since and occ <= now:
+                    legacy_income_total += abs(income.amount)
+
+        baseline += legacy_income_total
 
     # Save the actual current balance before it may be overridden below.
     actual_current_balance = baseline
@@ -559,7 +641,7 @@ def get_balance_projection(
         .all()
     )
 
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     end = today + timedelta(days=days)
 
     # When from_snapshot=True: project from snapshot date using raw snapshot amount,
@@ -577,18 +659,19 @@ def get_balance_projection(
         daily_delta[d] = 0.0
 
     # Preload actual transactions for early-payment detection (one year lookback covers all frequencies)
-    actual_txs_for_check = (
-        db.query(models.Transaction)
-        .filter(
-            models.Transaction.transaction_date >= start - timedelta(days=366),
-            models.Transaction.transaction_date < end,
-            models.Transaction.transaction_type.in_([
-                models.TransactionType.INCOME,
-                models.TransactionType.EXPENSE,
-            ]),
-        )
-        .all()
+    # Exclude credit-card/loan/investment accounts throughout.
+    actual_txs_q = db.query(models.Transaction).filter(
+        models.Transaction.transaction_date >= start - timedelta(days=366),
+        models.Transaction.transaction_date < end,
+        models.Transaction.transaction_type.in_([
+            models.TransactionType.INCOME,
+            models.TransactionType.EXPENSE,
+        ]),
     )
+    if liability_ids:
+        actual_txs_q = actual_txs_q.filter((models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)))
+    actual_txs_for_check = actual_txs_q.all()
+    legacy_income_txs = db.query(models.Income).all()
 
     # --- Recurring transactions (scheduled on exact days) ---
     for tx in recurring_txs:
@@ -611,6 +694,13 @@ def get_balance_projection(
                 if _is_fulfilled_early(tx, occ, actual_txs_for_check, today):
                     continue  # payment already came out early
                 daily_delta[key] += sign * amount
+
+    # --- Legacy recurring incomes (from /api/incomes) ---
+    for income in legacy_income_txs:
+        for occ in _legacy_income_occurrences(income, start, end):
+            key = occ.strftime("%Y-%m-%d")
+            if key in daily_delta:
+                daily_delta[key] += abs(income.amount)
 
     # --- Variable spending (prorated per calendar month) ---
     if estimation_method != "none":
@@ -721,18 +811,19 @@ def get_projection_breakdown(
     day_items: dict[str, list] = defaultdict(list)
 
     # Preload actual transactions for early-payment detection
-    actual_txs_for_check = (
-        db.query(models.Transaction)
-        .filter(
-            models.Transaction.transaction_date >= start - timedelta(days=366),
-            models.Transaction.transaction_date < end,
-            models.Transaction.transaction_type.in_([
-                models.TransactionType.INCOME,
-                models.TransactionType.EXPENSE,
-            ]),
-        )
-        .all()
+    liability_ids = _liability_account_ids(db)
+    _atx_q = db.query(models.Transaction).filter(
+        models.Transaction.transaction_date >= start - timedelta(days=366),
+        models.Transaction.transaction_date < end,
+        models.Transaction.transaction_type.in_([
+            models.TransactionType.INCOME,
+            models.TransactionType.EXPENSE,
+        ]),
     )
+    if liability_ids:
+        _atx_q = _atx_q.filter((models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)))
+    actual_txs_for_check = _atx_q.all()
+    legacy_income_txs = db.query(models.Income).all()
 
     # --- Recurring transactions (exclude transfers) ---
     recurring_txs = (
@@ -765,6 +856,16 @@ def get_projection_breakdown(
                 if _is_fulfilled_early(tx, occ, actual_txs_for_check, today):
                     continue  # payment already came out early
                 day_items[key].append(BreakdownItem(label=label, amount=round(signed_amount, 2)))
+
+    for income in legacy_income_txs:
+        label = (income.source or "Income")[:45]
+        for occ in _legacy_income_occurrences(income, start, end):
+            key = occ.strftime("%Y-%m-%d")
+            if key in day_items or (start <= occ < end):
+                day_items[key].append(BreakdownItem(
+                    label=f"{label} (income schedule)",
+                    amount=round(abs(income.amount), 2),
+                ))
 
     # --- Planned one-time expenses ---
     planned = db.query(models.PlannedExpense).all()
@@ -873,3 +974,4 @@ def delete_planned_income(income_id: int, db: Session = Depends(database.get_db)
         db.delete(item)
         db.commit()
     return {"ok": True}
+

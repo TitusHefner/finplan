@@ -80,6 +80,22 @@ export default function PlaidConnect({ onLinked }) {
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(null); // item_id being synced
 
+  const waitForSyncResult = async (jobId) => {
+    const maxAttempts = 90; // ~3 minutes at 2s intervals
+    for (let i = 0; i < maxAttempts; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // eslint-disable-next-line no-await-in-loop
+      const statusRes = await axios.get(`/api/plaid/sync/status/${jobId}`);
+      const job = statusRes.data;
+      if (job.status === 'done') return job.result;
+      if (job.status === 'error') {
+        throw new Error(job.error || 'Sync failed');
+      }
+    }
+    throw new Error('Sync timed out. Please try again.');
+  };
+
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
@@ -115,15 +131,19 @@ export default function PlaidConnect({ onLinked }) {
   const handleSync = async (itemId) => {
     setSyncing(itemId);
     try {
-      const res = await axios.post(`/api/plaid/sync/${itemId}`);
-      const { added, categorized } = res.data;
+      const startRes = await axios.post(`/api/plaid/sync/${itemId}`);
+      const result = await waitForSyncResult(startRes.data.job_id);
       setStatus({
         type: 'success',
-        message: `Synced! ${added} new transactions, ${categorized} auto-categorised.`,
+        message: `Synced! ${result.added} new, ${result.modified} updated, ${result.removed} removed.`,
       });
+      await fetchData();
       if (onLinked) onLinked();
     } catch (e) {
-      setStatus({ type: 'error', message: e.message });
+      setStatus({
+        type: 'error',
+        message: e.response?.data?.detail ?? e.message ?? 'Sync failed',
+      });
     } finally {
       setSyncing(null);
     }

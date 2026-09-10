@@ -209,8 +209,31 @@ export default function BankConnect() {
       // Reset the stored cursor so the next sync re-fetches everything since
       // the last successful page — Plaid often invalidates cursors after ITEM_LOGIN_REQUIRED
       await axios.post(`/api/plaid/items/${itemId}/reset-cursor`);
-      await axios.post(`/api/plaid/sync/${itemId}`);
-      notify('Re-authenticated successfully! Syncing transactions…', 'success');
+      const startRes = await axios.post(`/api/plaid/sync/${itemId}`);
+      const jobId = startRes.data.job_id;
+
+      const poll = () => new Promise((resolve, reject) => {
+        const iv = setInterval(async () => {
+          try {
+            const statusRes = await axios.get(`/api/plaid/sync/status/${jobId}`);
+            const job = statusRes.data;
+            if (job.status === 'done') {
+              clearInterval(iv);
+              resolve(job.result);
+            } else if (job.status === 'error') {
+              clearInterval(iv);
+              reject(new Error(job.error));
+            }
+          } catch (e) {
+            clearInterval(iv);
+            reject(e);
+          }
+        }, 2000);
+      });
+
+      const result = await poll();
+      const base = `Re-authenticated and synced: ${result.added} new, ${result.modified} updated, ${result.removed} removed.`;
+      notify(result.note ? `${base} ⚠️ ${result.note}` : base, result.note ? 'warning' : 'success');
       loadData();
     } catch (e) {
       notify('Re-auth succeeded but sync failed: ' + (e.response?.data?.detail ?? e.message), 'warning');
