@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes import expenses, forecasts, incomes, fixed_expenses, advanced, mobile, plaid, accounts, chat, balance
+from app.routes import expenses, forecasts, incomes, fixed_expenses, advanced, mobile, plaid, accounts, chat, balance, goals
 
 app = FastAPI(title="Smart Budget App", version="2.0.0", description="State-of-the-art personal finance management platform")
 
@@ -20,6 +20,9 @@ def _run_column_migrations(engine):
         ("transactions", "recurring_start_date","DATETIME"),
         ("transactions", "is_pending",          "BOOLEAN DEFAULT 0"),
         ("plaid_balance_snapshots", "id",        None),  # table existence check only
+        ("goals", "plaid_account_id",            "TEXT"),
+        ("plaid_items",  "is_liability",            "BOOLEAN DEFAULT 0"),
+        # manual_debt_accounts table is created via Base.metadata.create_all — no ALTER needed
     ]
     with engine.connect() as conn:
         for table, col, col_type in migrations:
@@ -35,7 +38,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3001"],  # React dev server
     # Allow Tailscale IPs (100.x.x.x) and MagicDNS hostnames (*.ts.net) on any port
-    allow_origin_regex=r"https?://(100\.\d+\.\d+\.\d+|[\w-]+\.ts\.net)(:\d+)?",
+    allow_origin_regex=r"https?://(100\.\d+\.\d+\.\d+|[\w.-]+\.ts\.net)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,6 +62,9 @@ app.include_router(plaid.router, prefix="/api/plaid", tags=["plaid"])
 
 # AI Financial Advisor chat
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
+
+# Goals & Financial Planning
+app.include_router(goals.router, prefix="/api/goals", tags=["goals"])
 
 # Balance tracking & projection
 app.include_router(balance.router, prefix="/api/balance", tags=["balance"])

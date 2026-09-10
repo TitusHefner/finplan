@@ -178,6 +178,8 @@ class Goal(Base):
     priority = Column(Integer, default=1)  # 1-5 scale
     is_completed = Column(Boolean, default=False)
     completed_at = Column(DateTime, nullable=True)
+    # For debt_payoff goals: links to a Plaid account so balance is synced live
+    plaid_account_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -208,6 +210,23 @@ class UserCategoryRule(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
     category = relationship("Category")
+
+
+# Manual Debt Accounts (for institutions not supported by Plaid)
+class ManualDebtAccount(Base):
+    __tablename__ = "manual_debt_accounts"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    debt_type = Column(String, nullable=False)   # credit_card | student_loan | mortgage | personal_loan | auto | other
+    institution_name = Column(String, nullable=True)
+    current_balance = Column(Float, nullable=False, default=0.0)
+    credit_limit = Column(Float, nullable=True)      # credit cards only
+    interest_rate = Column(Float, nullable=True)     # APR %
+    minimum_payment = Column(Float, nullable=True)
+    next_payment_due_date = Column(String, nullable=True)  # stored as ISO date string
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # Legacy Models (keeping for backward compatibility during migration)
 class FixedExpense(Base):
@@ -293,6 +312,9 @@ class PlaidItem(Base):
     institution_name = Column(String, nullable=True)
     cursor = Column(String, nullable=True)                      # Plaid transaction sync cursor
     last_synced_at = Column(DateTime, nullable=True)
+    # True when ALL accounts in this Item are credit/loan (e.g. a credit card bank).
+    # Transactions from liability items are excluded from the balance tracker.
+    is_liability = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     account = relationship("Account")

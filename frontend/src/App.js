@@ -11,6 +11,7 @@ import BudgetManager from './pages/BudgetManager';
 import CategoryManager from './pages/CategoryManager';
 import BalanceTracker from './pages/BalanceTracker';
 import RecurringManager from './pages/RecurringManager';
+import FinancialPlanning from './pages/FinancialPlanning';
 
 // Navigation Component
 function Navigation() {
@@ -23,6 +24,7 @@ function Navigation() {
     { path: '/transactions', label: 'Transactions', icon: '📝' },
     { path: '/connect', label: 'Bank Connect', icon: '🏦' },
     { path: '/budgets', label: 'Budgets', icon: '🎯' },
+    { path: '/planning', label: 'Planning', icon: '🏆' },
     { path: '/categories', label: 'Categories', icon: '🏷️' },
     { path: '/chat', label: 'AI Advisor', icon: '🤖' },
     { path: '/mobile', label: 'Mobile Preview', icon: '📱' }
@@ -72,6 +74,7 @@ function App() {
             <Route path="/connect" element={<BankConnect />} />
             <Route path="/bank-connect" element={<BankConnect />} />
             <Route path="/budgets" element={<BudgetManager />} />
+            <Route path="/planning" element={<FinancialPlanning />} />
             <Route path="/categories" element={<CategoryManager />} />
             <Route path="/chat" element={<ChatAdvisor />} />
             <Route path="/mobile" element={<MobileApp />} />
