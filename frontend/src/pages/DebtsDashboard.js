@@ -42,6 +42,14 @@ function pct(n) {
   return `${Number(n || 0).toFixed(1)}%`;
 }
 
+function payoffDateFromNow(monthsToDebtFree) {
+  const m = Number(monthsToDebtFree || 0);
+  if (!Number.isFinite(m) || m <= 0) return 'Now';
+  const d = new Date();
+  d.setMonth(d.getMonth() + m);
+  return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short' });
+}
+
 function normalizeManualDebt(d) {
   return {
     id: `manual-${d.id}`,
@@ -406,6 +414,20 @@ export default function DebtsDashboard() {
     };
   }, [strategyData]);
 
+  const customPlan = strategyData?.custom_plan || null;
+  const baselineSnowball = useMemo(
+    () => (strategyData?.strategies || []).find(s => s.strategy === 'snowball') || null,
+    [strategyData]
+  );
+  const baselineAvalanche = useMemo(
+    () => (strategyData?.strategies || []).find(s => s.strategy === 'avalanche') || null,
+    [strategyData]
+  );
+  const nearTermPayoffs = useMemo(
+    () => (customPlan?.student_payoff_order || []).filter(p => Number(p.month || 0) <= 12),
+    [customPlan]
+  );
+
   const selectedCardTrajectory = useMemo(
     () => cardAccountTrajectories.find(a => a.name === selectedCardAccount) || null,
     [cardAccountTrajectories, selectedCardAccount]
@@ -485,6 +507,15 @@ export default function DebtsDashboard() {
             <Metric title='Credit Cards' value={fmt(totals.creditTotal)} color='#922b21' />
             <Metric title='Debt-to-Income (Est.)' value={pct(totals.dti)} color={totals.dti >= 43 ? '#c0392b' : totals.dti >= 30 ? '#d68910' : '#1e8449'} />
           </div>
+
+          {!!customPlan && (
+            <div style={styles.grid4}>
+              <Metric title='Plan Debt-Free' value={`M${customPlan.months_to_debt_free || 0}`} color='#1f618d' />
+              <Metric title='Projected Debt-Free Date' value={payoffDateFromNow(customPlan.months_to_debt_free)} color='#117864' />
+              <Metric title='Student X In Use' value={fmt(customPlan.student_extra_payment_used)} color='#1e8449' />
+              <Metric title='Plan Interest (Total)' value={fmt(customPlan.total_interest_paid)} color='#a04000' />
+            </div>
+          )}
 
           <div style={styles.grid2}>
             <div style={styles.panel}>
@@ -691,6 +722,32 @@ export default function DebtsDashboard() {
                 />
               </div>
 
+              <div style={styles.grid4}>
+                <Metric title='Plan Debt-Free' value={`M${customPlan?.months_to_debt_free || 0}`} color='#1f618d' />
+                <Metric title='Projected Debt-Free Date' value={payoffDateFromNow(customPlan?.months_to_debt_free)} color='#117864' />
+                <Metric title='Plan Total Paid' value={fmt(customPlan?.total_paid)} color='#566573' />
+                <Metric title='Plan Total Interest' value={fmt(customPlan?.total_interest_paid)} color='#a04000' />
+              </div>
+
+              <div style={styles.panel}>
+                <h3 style={styles.panelTitle}>Plan Assumptions</h3>
+                <div style={styles.infoRow}><strong>Card Focus:</strong> {customPlan?.fixed_card || 'N/A'} at {fmt(customPlan?.fixed_card_monthly_payment)} / month</div>
+                <div style={styles.infoRow}><strong>Student Strategy:</strong> {String(customPlan?.student_strategy || 'avalanche').toUpperCase()}</div>
+                <div style={styles.infoRow}><strong>Student X Source:</strong> {customPlan?.student_extra_is_manual_override ? 'Manual override' : 'Cashflow auto-calc'}</div>
+                <div style={styles.infoRow}><strong>Student X Used:</strong> {fmt(customPlan?.student_extra_payment_used)}</div>
+                <div style={styles.infoRow}><strong>Student X Recommended:</strong> {fmt(customPlan?.recommended_student_extra_payment)}</div>
+                <div style={styles.infoRow}><strong>Grace End Assumption:</strong> {customPlan?.grace_period?.assumed_grace_end_date ? new Date(customPlan.grace_period.assumed_grace_end_date).toLocaleDateString() : 'Per account due date / unknown'}</div>
+                <div style={styles.infoRow}><strong>Income - Non-Debt Expenses (Est.):</strong> {fmt((strategyData.context?.monthly_income_estimate || 0) - (strategyData.context?.monthly_non_debt_expenses_estimate || 0))}</div>
+              </div>
+
+              <div style={styles.panel}>
+                <h3 style={styles.panelTitle}>Timeline Comparison</h3>
+                <div style={styles.infoRow}><strong>Custom Plan:</strong> M{customPlan?.months_to_debt_free || 0} ({payoffDateFromNow(customPlan?.months_to_debt_free)})</div>
+                <div style={styles.infoRow}><strong>Baseline Avalanche:</strong> {baselineAvalanche ? `M${baselineAvalanche.months_to_debt_free}` : 'N/A'}</div>
+                <div style={styles.infoRow}><strong>Baseline Snowball:</strong> {baselineSnowball ? `M${baselineSnowball.months_to_debt_free}` : 'N/A'}</div>
+                <div style={styles.infoRow}><strong>Interest vs Baseline Snowball:</strong> {baselineSnowball ? fmt((baselineSnowball.total_interest_paid || 0) - (customPlan?.total_interest_paid || 0)) : 'N/A'} lower</div>
+              </div>
+
               <div style={styles.panel}>
                 <div style={styles.rowBetween}>
                   <h3 style={styles.panelTitle}>Student X Override</h3>
@@ -757,6 +814,33 @@ export default function DebtsDashboard() {
                     </tbody>
                   </table>
                 </div>
+              </div>
+
+              <div style={styles.panel}>
+                <h3 style={styles.panelTitle}>Next 12-Month Student Milestones</h3>
+                {!nearTermPayoffs.length && (
+                  <p style={styles.footnote}>No student loans are projected to fully close in the next 12 months under current settings.</p>
+                )}
+                {!!nearTermPayoffs.length && (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={styles.table}>
+                      <thead>
+                        <tr>
+                          <th style={styles.th}>Loan</th>
+                          <th style={styles.th}>Projected Payoff Month</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {nearTermPayoffs.map((row) => (
+                          <tr key={row.name}>
+                            <td style={styles.td}>{row.name}</td>
+                            <td style={styles.td}>{`M${row.month}`}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
 
               <div style={styles.panel}>
@@ -945,6 +1029,11 @@ const styles = {
     marginBottom: 0,
     color: '#7f8c8d',
     fontSize: 12,
+  },
+  infoRow: {
+    color: '#2c3e50',
+    fontSize: 14,
+    lineHeight: 1.6,
   },
   card: {
     background: '#fff',

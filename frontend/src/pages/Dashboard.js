@@ -110,7 +110,6 @@ function Dashboard() {
   const [data, setData]       = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeCat, setActiveCat] = useState(null);
-  const [debtPlan, setDebtPlan] = useState(null);
 
   // Savings balance editing
   const [editingSavings, setEditingSavings] = useState(false);
@@ -123,72 +122,9 @@ function Dashboard() {
     setLoading(true);
     setData(null);
     setActiveCat(null);
-    setDebtPlan(null);
     try {
-      const [summaryRes, manualRes, liabilitiesRes] = await Promise.all([
-        axios.get(`/api/analytics/monthly-summary?year=${year}&month=${month}`),
-        axios.get('/api/goals/manual-debts/').catch(() => ({ data: [] })),
-        axios.get('/api/plaid/liabilities').catch(() => ({ data: { credit: [], student: [], mortgage: [] } })),
-      ]);
-
+      const summaryRes = await axios.get(`/api/analytics/monthly-summary?year=${year}&month=${month}`);
       setData(summaryRes.data);
-
-      const manualDebts = Array.isArray(manualRes.data) ? manualRes.data : [];
-      const liabilities = liabilitiesRes.data || { credit: [], student: [], mortgage: [] };
-
-      const strategyDebts = [];
-      for (const d of manualDebts) {
-        strategyDebts.push({
-          name: d.name,
-          debt_type: d.debt_type,
-          current_balance: Math.abs(Number(d.current_balance || 0)),
-          interest_rate: Number(d.interest_rate || 0),
-          minimum_payment: d.minimum_payment_amount != null ? Number(d.minimum_payment_amount) : null,
-          institution_name: d.institution_name || '',
-          source: 'manual',
-          next_payment_due_date: d.next_payment_due_date || null,
-        });
-      }
-      for (const s of liabilities.student || []) {
-        strategyDebts.push({
-          name: s.name,
-          debt_type: 'student_loan',
-          current_balance: Math.abs(Number(s.current_balance || 0)),
-          interest_rate: Number(s.interest_rate_percentage || 0),
-          minimum_payment: s.minimum_payment_amount != null ? Number(s.minimum_payment_amount) : null,
-          institution_name: s.institution_name || '',
-          source: 'plaid',
-          next_payment_due_date: s.next_payment_due_date || null,
-        });
-      }
-      for (const c of liabilities.credit || []) {
-        strategyDebts.push({
-          name: c.name,
-          debt_type: 'credit_card',
-          current_balance: Math.abs(Number(c.current_balance || 0)),
-          interest_rate: Number(c.purchase_apr || 0),
-          minimum_payment: c.minimum_payment_amount != null ? Number(c.minimum_payment_amount) : null,
-          institution_name: c.institution_name || '',
-          source: 'plaid',
-          next_payment_due_date: c.next_payment_due_date || null,
-        });
-      }
-
-      const strategyPayload = {
-        debts: strategyDebts,
-        extra_payment_budget: 0,
-        lookback_days: 120,
-        fixed_credit_card_name: 'AAdvantage',
-        fixed_credit_card_autopay: 250,
-        fixed_credit_card_extra: 750,
-        student_strategy: 'avalanche',
-        ignore_estimated_student_minimums: true,
-        graduation_date: '2026-05-15',
-        grace_period_months: 6,
-      };
-
-      const strategyRes = await axios.post('/api/goals/debt-strategy', strategyPayload).catch(() => null);
-      setDebtPlan(strategyRes?.data || null);
     } catch (e) {
       console.error('Monthly summary error:', e);
     }
@@ -370,60 +306,6 @@ function Dashboard() {
                 : 'sc-deficit'
               }
             />
-          </div>
-
-          <div className="dash-section dash-full">
-            <h2 className="section-title">Debt Payoff At A Glance</h2>
-            {!debtPlan ? (
-              <div className="dash-empty">
-                <div className="de-icon">📉</div>
-                <p>Debt payoff timeline unavailable right now.</p>
-              </div>
-            ) : (
-              <>
-                <div className="debt-glance-grid">
-                  <SummaryCard
-                    title="Plan Debt-Free"
-                    value={`M${debtPlan.custom_plan?.months_to_debt_free ?? '—'}`}
-                    sub="Fixed AAdvantage + student strategy"
-                    accent="sc-income"
-                  />
-                  <SummaryCard
-                    title="Student X Used"
-                    value={fmt(debtPlan.custom_plan?.student_extra_payment_used || 0)}
-                    sub={debtPlan.custom_plan?.student_extra_is_manual_override ? 'Manual override' : 'Auto-calculated'}
-                    accent="sc-savings"
-                  />
-                  <SummaryCard
-                    title="Plan Interest"
-                    value={fmt(debtPlan.custom_plan?.total_interest_paid || 0)}
-                    sub="Projected total interest"
-                    accent="sc-expenses"
-                  />
-                  <SummaryCard
-                    title="Best Baseline"
-                    value={(() => {
-                      const rows = debtPlan.strategies || [];
-                      if (!rows.length) return 'N/A';
-                      const best = [...rows].sort((a, b) => a.months_to_debt_free - b.months_to_debt_free)[0];
-                      return `${(best.strategy || '').toUpperCase()} M${best.months_to_debt_free}`;
-                    })()}
-                    sub="Across baseline strategies"
-                    accent="sc-warn"
-                  />
-                </div>
-
-                <div className="debt-order-preview">
-                  <h3 className="section-title" style={{ marginBottom: 10 }}>Student Attack Order Preview</h3>
-                  {(debtPlan.custom_plan?.student_attack_order || []).slice(0, 5).map((row, idx) => (
-                    <div key={`${row.name}-${idx}`} className="debt-order-row">
-                      <span>#{idx + 1} {row.name}</span>
-                      <span>{row.in_grace_now ? 'Grace' : 'Repayment'} · APR {Number(row.apr || 0).toFixed(2)}%</span>
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
           </div>
 
           {/* ── Savings balance card ── */}
