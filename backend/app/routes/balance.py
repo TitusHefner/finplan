@@ -974,4 +974,3 @@ def delete_planned_income(income_id: int, db: Session = Depends(database.get_db)
         db.delete(item)
         db.commit()
     return {"ok": True}
-

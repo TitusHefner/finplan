@@ -406,6 +406,27 @@ _DEBT_WORD_STOPLIST = {
     "pay", "bank", "card", "credit", "account", "the", "and", "for",
 }
 
+_DEBT_CATEGORY_KEYWORDS = {
+    "credit card payment",
+    "credit card payments",
+    "loan payment",
+    "loan payments",
+    "student loan",
+    "student loans",
+    "car payment",
+    "auto loan",
+    "mortgage",
+    "debt payment",
+}
+
+_MISCLASSIFIED_EXPENSE_CATEGORY_KEYWORDS = {
+    "salary",
+    "payroll",
+    "income",
+    "paycheck",
+    "direct deposit",
+}
+
 
 def _estimate_min_payment(balance: float, debt_type: str, provided_min: Optional[float]) -> float:
     if provided_min is not None and provided_min > 0:
@@ -422,6 +443,32 @@ def _keyword_tokens(text: Optional[str]) -> list[str]:
         return []
     toks = [t.lower() for t in re.findall(r"[a-zA-Z0-9]+", text)]
     return [t for t in toks if len(t) >= 4 and t not in _DEBT_WORD_STOPLIST]
+
+
+def _is_debt_service_expense(
+    tx: models.Transaction,
+    category_name: str,
+    debt_tokens: set[str],
+) -> bool:
+    """
+    Heuristic filter to exclude debt-service and transfer-like expenses from
+    lifestyle (non-debt) expense estimation.
+    """
+    desc = (tx.description or "").lower().strip()
+    cat = (category_name or "").lower().strip()
+
+    if any(k in cat for k in _DEBT_CATEGORY_KEYWORDS):
+        return True
+
+    # Exclude obvious import artifacts that are often account transfers.
+    if re.match(r"^xx\d{3,6}\b", desc):
+        return True
+
+    paymentish = any(k in desc for k in ["payment", "autopay", "web ", "ach", "online"])
+    if paymentish and any(tok in desc for tok in debt_tokens):
+        return True
+
+    return False
 
 
 def _detect_manual_debt_payments(
@@ -989,11 +1036,55 @@ def build_debt_strategy(payload: DebtStrategyRequest, db: Session = Depends(data
         .all()
     )
     income_total = sum(abs(float(t.amount or 0.0)) for t in txs if t.transaction_type == models.TransactionType.INCOME)
-    non_debt_expense_total = sum(
-        abs(float(t.amount or 0.0))
-        for t in txs
-        if t.transaction_type == models.TransactionType.EXPENSE and t.id not in matched_tx_ids
-    )
+
+    category_map = {c.id: c for c in db.query(models.Category).all()}
+    debt_tokens: set[str] = set()
+    for d in debts:
+        debt_tokens.update(_keyword_tokens(d.get("name")))
+        debt_tokens.update(_keyword_tokens(d.get("institution_name")))
+
+    non_debt_expense_total = 0.0
+    excluded_expense_total = 0.0
+    excluded_expense_count = 0
+    included_expense_count = 0
+
+    for t in txs:
+        if t.transaction_type != models.TransactionType.EXPENSE:
+            continue
+
+        amt = abs(float(t.amount or 0.0))
+
+        if t.id in matched_tx_ids:
+            excluded_expense_total += amt
+            excluded_expense_count += 1
+            continue
+
+        if bool(t.is_pending):
+            excluded_expense_total += amt
+            excluded_expense_count += 1
+            continue
+
+        cat = category_map.get(t.category_id) if t.category_id is not None else None
+        cat_name = (cat.name if cat else "")
+        cat_name_norm = cat_name.lower().strip()
+
+        # Guardrail: exclude expenses that are clearly miscategorized as income/savings.
+        if cat and (cat.is_income or cat.is_savings):
+            excluded_expense_total += amt
+            excluded_expense_count += 1
+            continue
+        if any(k in cat_name_norm for k in _MISCLASSIFIED_EXPENSE_CATEGORY_KEYWORDS):
+            excluded_expense_total += amt
+            excluded_expense_count += 1
+            continue
+
+        if _is_debt_service_expense(t, cat_name_norm, debt_tokens):
+            excluded_expense_total += amt
+            excluded_expense_count += 1
+            continue
+
+        non_debt_expense_total += amt
+        included_expense_count += 1
 
     months = max(payload.lookback_days / 30.0, 2.0)
     monthly_income = income_total / months
@@ -1044,6 +1135,9 @@ def build_debt_strategy(payload: DebtStrategyRequest, db: Session = Depends(data
             "lookback_days": payload.lookback_days,
             "monthly_income_estimate": round(monthly_income, 2),
             "monthly_non_debt_expenses_estimate": round(monthly_non_debt_expenses, 2),
+            "expense_rows_included": included_expense_count,
+            "expense_rows_excluded": excluded_expense_count,
+            "excluded_expense_total": round(excluded_expense_total, 2),
             "baseline_minimum_payments": round(baseline_minimums, 2),
             "available_extra_payment_estimate": round(available_extra, 2),
             "monthly_budget_used_for_strategy": round(budget, 2),
