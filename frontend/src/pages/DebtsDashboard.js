@@ -95,6 +95,58 @@ function normalizePlaidCreditDebt(d) {
   };
 }
 
+function normalizePlaidDebtAccountFallback(d) {
+  const type = String(d.type || '').toLowerCase();
+  const subtype = String(d.subtype || '').toLowerCase();
+  const isCredit = type === 'credit' || subtype.includes('credit');
+  const isStudent = type === 'loan' && subtype.includes('student');
+
+  if (isCredit) {
+    return {
+      account_id: d.account_id,
+      name: d.name || d.official_name || 'Credit Card',
+      institution_name: d.institution_name || 'Plaid',
+      subtype: d.subtype || '',
+      current_balance: Number(d.current_balance || 0),
+      credit_limit: d.credit_limit != null ? Number(d.credit_limit) : null,
+      available: null,
+      currency: d.currency || 'USD',
+      last_payment_amount: null,
+      last_payment_date: '',
+      last_statement_balance: null,
+      last_statement_issue_date: '',
+      minimum_payment_amount: null,
+      next_payment_due_date: '',
+      is_overdue: false,
+      aprs: [],
+      purchase_apr: null,
+    };
+  }
+
+  if (isStudent) {
+    return {
+      account_id: d.account_id,
+      name: d.name || d.official_name || 'Student Loan',
+      institution_name: d.institution_name || 'Plaid',
+      servicer_address: null,
+      current_balance: Number(d.current_balance || 0),
+      currency: d.currency || 'USD',
+      interest_rate_percentage: null,
+      minimum_payment_amount: null,
+      next_payment_due_date: '',
+      origination_principal_amount: null,
+      outstanding_interest_amount: null,
+      last_payment_amount: null,
+      last_payment_date: '',
+      is_overdue: false,
+      repayment_plan: '',
+      expected_payoff_date: '',
+    };
+  }
+
+  return null;
+}
+
 function estimateMinPayment(debt) {
   if (debt.minPayment && debt.minPayment > 0) return debt.minPayment;
   if (debt.debtType === 'credit_card') return Math.max(35, debt.balance * 0.025);
@@ -203,14 +255,48 @@ export default function DebtsDashboard() {
     setError('');
     try {
       const now = new Date();
-      const [manualRes, liabilitiesRes, monthlyRes] = await Promise.all([
+      const [manualRes, liabilitiesRes, debtAccountsRes, monthlyRes] = await Promise.all([
         axios.get('/api/goals/manual-debts/').catch(() => ({ data: [] })),
         axios.get('/api/plaid/liabilities').catch(() => ({ data: { credit: [], student: [], mortgage: [] } })),
+        axios.get('/api/plaid/debt-accounts').catch(() => ({ data: [] })),
         axios.get(`/api/analytics/monthly-summary?year=${now.getFullYear()}&month=${now.getMonth() + 1}`).catch(() => ({ data: { income: 0 } })),
       ]);
 
+      const liabilities = liabilitiesRes.data || { credit: [], student: [], mortgage: [] };
+      const fallbackDebtAccounts = Array.isArray(debtAccountsRes.data) ? debtAccountsRes.data : [];
+
+      const fallbackCredit = [];
+      const fallbackStudent = [];
+      for (const row of fallbackDebtAccounts) {
+        const normalized = normalizePlaidDebtAccountFallback(row);
+        if (!normalized) continue;
+        const type = String(row.type || '').toLowerCase();
+        const subtype = String(row.subtype || '').toLowerCase();
+        if (type === 'credit' || subtype.includes('credit')) {
+          fallbackCredit.push(normalized);
+        } else if (type === 'loan' && subtype.includes('student')) {
+          fallbackStudent.push(normalized);
+        }
+      }
+
+      const creditSeen = new Set((liabilities.credit || []).map(c => String(c.account_id || c.name || '')));
+      const mergedCredit = [
+        ...(liabilities.credit || []),
+        ...fallbackCredit.filter(c => !creditSeen.has(String(c.account_id || c.name || ''))),
+      ];
+
+      const studentSeen = new Set((liabilities.student || []).map(s => String(s.account_id || s.name || '')));
+      const mergedStudent = [
+        ...(liabilities.student || []),
+        ...fallbackStudent.filter(s => !studentSeen.has(String(s.account_id || s.name || ''))),
+      ];
+
       setManualDebts(Array.isArray(manualRes.data) ? manualRes.data : []);
-      setPlaidLiabilities(liabilitiesRes.data || { credit: [], student: [], mortgage: [] });
+      setPlaidLiabilities({
+        ...liabilities,
+        credit: mergedCredit,
+        student: mergedStudent,
+      });
       setMonthlyIncome(Number(monthlyRes.data?.income || 0));
     } catch (e) {
       setError(e.response?.data?.detail || e.message || 'Failed to load debt data');
