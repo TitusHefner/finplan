@@ -299,6 +299,9 @@ def _is_fulfilled_early(
     for tx in actual_txs:
         if tx.id == recurring_tx.id:
             continue
+        # Pending rows should not suppress scheduled recurring entries.
+        if bool(getattr(tx, "is_pending", False)):
+            continue
         if tx.transaction_type != target_type:
             continue
         if abs(abs(tx.amount) - target_amount) > tolerance:
@@ -756,17 +759,19 @@ def get_balance_projection(
     # Accumulate into running balance.
     # When from_snapshot=True the baseline is the raw snapshot amount, so the
     # projected line may diverge from the actual current balance over time.
-    # Re-anchor: once the loop reaches today, compute an adjustment so that the
-    # projected balance at today equals the actual current balance.  All future
-    # dates are shifted by the same amount, giving an accurate forward forecast
-    # while keeping the historical comparison line intact.
+    # Re-anchor the projection before today's scheduled events. This preserves
+    # payday income in the forecast when the bank feed still marks it pending.
     today_str = today.strftime("%Y-%m-%d")
+    anchor_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    if anchor_str not in daily_delta:
+        # Fallback when there is no prior-day point in range.
+        anchor_str = today_str
     result = []
     running = baseline
     adjustment = 0.0
     for key in sorted(daily_delta.keys()):
         running += daily_delta[key]
-        if from_snapshot and snapshot and key == today_str:
+        if from_snapshot and snapshot and key == anchor_str:
             adjustment = actual_current_balance - running
         result.append(ProjectionPoint(date=key, balance=round(running + adjustment, 2)))
 
