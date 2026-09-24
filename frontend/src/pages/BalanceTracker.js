@@ -42,6 +42,7 @@ export default function BalanceTracker() {
   const [dayBreakdown, setDayBreakdown] = useState([]);
   const [recurringOccurrences, setRecurringOccurrences] = useState([]);
   const [overrideSavingKey, setOverrideSavingKey] = useState('');
+  const [selectedOverrideDate, setSelectedOverrideDate] = useState('');
   const [plaidBalances, setPlaidBalances] = useState([]);
   const [plaidHistory, setPlaidHistory] = useState([]);
   const [trackerAccountId, setTrackerAccountId] = useState(null);
@@ -356,6 +357,13 @@ export default function BalanceTracker() {
       .finally(() => setOverrideSavingKey(''));
   };
 
+  const recurringOnSelectedDate = useMemo(() => {
+    if (!selectedOverrideDate) return [];
+    return recurringOccurrences
+      .filter(item => item.occurrence_date === selectedOverrideDate)
+      .sort((a, b) => a.description.localeCompare(b.description));
+  }, [recurringOccurrences, selectedOverrideDate]);
+
   // Safety buffer analysis
   const fmt = (n) =>
     typeof n === 'number'
@@ -597,6 +605,14 @@ export default function BalanceTracker() {
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
+    onClick: (_event, elements, chart) => {
+      if (!elements || elements.length === 0) return;
+      const point = elements[0];
+      const idx = point?.index;
+      if (idx == null) return;
+      const clickedDate = chart?.data?.labels?.[idx];
+      if (clickedDate) setSelectedOverrideDate(String(clickedDate));
+    },
     plugins: {
       legend: {
         display: true,
@@ -896,6 +912,66 @@ export default function BalanceTracker() {
           </p>
         )}
 
+        {allDates.length > 0 && (
+          <div style={{ marginTop: '14px', padding: '12px', border: '1px solid #e5e7eb', borderRadius: 8, background: '#fafafa' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <div style={{ fontSize: 13, color: '#374151' }}>
+                Click any date on the chart to manage recurring overrides for that day.
+              </div>
+              {selectedOverrideDate && (
+                <button
+                  onClick={() => setSelectedOverrideDate('')}
+                  style={{ ...pillStyle, background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db' }}
+                >
+                  Clear selection
+                </button>
+              )}
+            </div>
+
+            {!selectedOverrideDate ? (
+              <div style={{ marginTop: 10, fontSize: 13, color: '#9ca3af' }}>
+                No date selected.
+              </div>
+            ) : recurringOnSelectedDate.length === 0 ? (
+              <div style={{ marginTop: 10, fontSize: 13, color: '#9ca3af' }}>
+                No recurring expense occurrences on {new Date(`${selectedOverrideDate}T00:00:00`).toLocaleDateString()}.
+              </div>
+            ) : (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#111827', marginBottom: 8 }}>
+                  Recurring expenses on {new Date(`${selectedOverrideDate}T00:00:00`).toLocaleDateString()}
+                </div>
+                <div style={{ display: 'grid', gap: 8 }}>
+                  {recurringOnSelectedDate.map((item) => {
+                    const rowKey = `${item.transaction_id}-${item.occurrence_date}`;
+                    const isSaving = overrideSavingKey === rowKey;
+                    return (
+                      <div key={rowKey} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '8px 10px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fff' }}>
+                        <div>
+                          <div style={{ fontSize: 14, color: '#111827' }}>{item.description}</div>
+                          <div style={{ fontSize: 12, color: '#6b7280' }}>{fmt(item.amount)}</div>
+                        </div>
+                        <button
+                          onClick={() => handleToggleRecurringOverride(item)}
+                          disabled={isSaving}
+                          style={{
+                            ...pillStyle,
+                            background: item.is_overridden ? '#dcfce7' : '#fff7ed',
+                            color: item.is_overridden ? '#166534' : '#9a3412',
+                            border: '1px solid #e5e7eb',
+                          }}
+                        >
+                          {isSaving ? 'Saving…' : item.is_overridden ? 'Unskip' : 'Skip'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {allDates.length > 0 && effectiveProjection.length > 0 && (() => {
           const last = effectiveProjection[effectiveProjection.length - 1];
           const allPoints = [...history, ...projection];
@@ -1002,7 +1078,7 @@ export default function BalanceTracker() {
                 const rowKey = `${item.transaction_id}-${item.occurrence_date}`;
                 const isSaving = overrideSavingKey === rowKey;
                 return (
-                  <tr key={rowKey} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                  <tr key={rowKey} style={{ borderBottom: '1px solid #f3f4f6', background: selectedOverrideDate === item.occurrence_date ? '#f8fafc' : '#fff' }}>
                     <td style={tdStyle}>{new Date(`${item.occurrence_date}T00:00:00`).toLocaleDateString()}</td>
                     <td style={tdStyle}>{item.description}</td>
                     <td style={{ ...tdStyle, textAlign: 'right', color: '#dc2626' }}>{fmt(item.amount)}</td>
