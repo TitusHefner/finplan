@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from app import models, database
 from pydantic import BaseModel, field_validator
@@ -6,6 +7,14 @@ from typing import List, Optional
 from datetime import datetime
 
 router = APIRouter()
+
+
+def _exclude_credit_card_transaction_filter():
+    """Exclude expense rows that belong to credit-card accounts."""
+    return or_(
+        models.Transaction.account_id.is_(None),
+        models.Account.type != models.AccountType.CREDIT_CARD,
+    )
 
 # Pydantic Models
 class AccountCreate(BaseModel):
@@ -555,9 +564,11 @@ def get_monthly_summary(year: int, month: int, db: Session = Depends(database.ge
     # ── All transactions in the month ─────────────────────────────────
     txns = (
         db.query(models.Transaction)
+        .outerjoin(models.Account, models.Transaction.account_id == models.Account.id)
         .filter(
             models.Transaction.transaction_date >= start,
             models.Transaction.transaction_date <= end,
+            _exclude_credit_card_transaction_filter(),
         )
         .all()
     )
@@ -593,9 +604,12 @@ def get_monthly_summary(year: int, month: int, db: Session = Depends(database.ge
 
     all_time_savings = db.query(
         func.sum(func.abs(models.Transaction.amount))
-    ).join(models.Category, models.Transaction.category_id == models.Category.id).filter(
+    ).join(models.Category, models.Transaction.category_id == models.Category.id).outerjoin(
+        models.Account, models.Transaction.account_id == models.Account.id
+    ).filter(
         models.Category.is_savings == True,
         models.Transaction.transaction_type == models.TransactionType.EXPENSE,
+        _exclude_credit_card_transaction_filter(),
     ).scalar() or 0.0
 
     total_savings = savings_base + all_time_savings
@@ -611,11 +625,13 @@ def get_monthly_summary(year: int, month: int, db: Session = Depends(database.ge
             func.count(models.Transaction.id).label("count"),
         )
         .join(models.Transaction, models.Transaction.category_id == models.Category.id)
+        .outerjoin(models.Account, models.Transaction.account_id == models.Account.id)
         .filter(
             models.Transaction.transaction_date >= start,
             models.Transaction.transaction_date <= end,
             models.Transaction.transaction_type == models.TransactionType.EXPENSE,
             models.Category.is_savings == False,
+            _exclude_credit_card_transaction_filter(),
         )
         .group_by(models.Category.id)
         .order_by(func.sum(func.abs(models.Transaction.amount)).desc())
@@ -698,10 +714,11 @@ def get_monthly_summary(year: int, month: int, db: Session = Depends(database.ge
 
         spent_q = db.query(
             func.sum(func.abs(models.Transaction.amount))
-        ).filter(
+        ).outerjoin(models.Account, models.Transaction.account_id == models.Account.id).filter(
             models.Transaction.transaction_date >= start,
             models.Transaction.transaction_date <= end,
             models.Transaction.transaction_type == models.TransactionType.EXPENSE,
+            _exclude_credit_card_transaction_filter(),
         )
         if b.category_id:
             spent_q = spent_q.filter(models.Transaction.category_id == b.category_id)

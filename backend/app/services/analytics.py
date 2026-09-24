@@ -8,6 +8,15 @@ class AnalyticsService:
     def __init__(self, db: Session):
         self.db = db
 
+    def _exclude_credit_card_filter(self):
+        """Keep cash-flow/spending analytics focused on non-credit-card spend."""
+        from app.models import Transaction, Account, AccountType
+
+        return or_(
+            Transaction.account_id.is_(None),
+            Account.type != AccountType.CREDIT_CARD,
+        )
+
     def get_financial_summary(self, user_id: int = None) -> Dict[str, Any]:
         """Get comprehensive financial summary"""
         # Account balances
@@ -20,10 +29,16 @@ class AnalyticsService:
         current_year = datetime.now().year
 
         from app.models import Transaction
-        monthly_transactions = self.db.query(Transaction).filter(
-            extract('month', Transaction.transaction_date) == current_month,
-            extract('year', Transaction.transaction_date) == current_year
-        ).all()
+        monthly_transactions = (
+            self.db.query(Transaction)
+            .outerjoin(Account, Transaction.account_id == Account.id)
+            .filter(
+                extract('month', Transaction.transaction_date) == current_month,
+                extract('year', Transaction.transaction_date) == current_year,
+                self._exclude_credit_card_filter(),
+            )
+            .all()
+        )
 
         from app.models import TransactionType
         monthly_income = sum(t.amount for t in monthly_transactions if t.transaction_type == TransactionType.INCOME)
@@ -42,7 +57,7 @@ class AnalyticsService:
 
     def get_monthly_breakdown(self, months: int = 3) -> List[Dict[str, Any]]:
         """Return income, expenses, and savings rate for each of the last N months."""
-        from app.models import Transaction, TransactionType
+        from app.models import Transaction, TransactionType, Account
         results = []
         now = datetime.now()
         for i in range(months - 1, -1, -1):
@@ -56,10 +71,16 @@ class AnalyticsService:
             last_day = _cal.monthrange(year, month)[1]
             start = datetime(year, month, 1)
             end = datetime(year, month, last_day, 23, 59, 59)
-            txs = self.db.query(Transaction).filter(
-                Transaction.transaction_date >= start,
-                Transaction.transaction_date <= end,
-            ).all()
+            txs = (
+                self.db.query(Transaction)
+                .outerjoin(Account, Transaction.account_id == Account.id)
+                .filter(
+                    Transaction.transaction_date >= start,
+                    Transaction.transaction_date <= end,
+                    self._exclude_credit_card_filter(),
+                )
+                .all()
+            )
             income = sum(t.amount for t in txs if t.transaction_type == TransactionType.INCOME)
             expenses = abs(sum(t.amount for t in txs if t.transaction_type == TransactionType.EXPENSE))
             savings_rate = (income - expenses) / income * 100 if income > 0 else 0
@@ -127,13 +148,16 @@ class AnalyticsService:
         end_date: str = None,
     ) -> List[Dict[str, Any]]:
         """Spending totals by category for an arbitrary date range."""
-        from app.models import Transaction, Category, TransactionType
+        from app.models import Transaction, Category, TransactionType, Account
 
         q = self.db.query(
             Category.name,
             func.sum(Transaction.amount).label("total"),
-        ).outerjoin(Transaction, Transaction.category_id == Category.id).filter(
+        ).outerjoin(Transaction, Transaction.category_id == Category.id).outerjoin(
+            Account, Transaction.account_id == Account.id
+        ).filter(
             Transaction.transaction_type == TransactionType.EXPENSE,
+            self._exclude_credit_card_filter(),
         )
         if start_date:
             q = q.filter(Transaction.transaction_date >= datetime.fromisoformat(start_date))
@@ -166,16 +190,19 @@ class AnalyticsService:
 
     def get_spending_by_category(self, months: int = 3) -> List[Dict[str, Any]]:
         """Get spending breakdown by category"""
-        from app.models import Transaction, Category
+        from app.models import Transaction, Category, Account
 
         start_date = datetime.now() - timedelta(days=30 * months)
 
         results = self.db.query(
             Category.name,
             func.sum(Transaction.amount).label('total_spent')
-        ).join(Transaction).filter(
+        ).join(Transaction).outerjoin(
+            Account, Transaction.account_id == Account.id
+        ).filter(
             Transaction.transaction_type == 'expense',
-            Transaction.transaction_date >= start_date
+            Transaction.transaction_date >= start_date,
+            self._exclude_credit_card_filter(),
         ).group_by(Category.name).all()
 
         return [
@@ -185,18 +212,25 @@ class AnalyticsService:
 
     def get_budget_performance(self) -> List[Dict[str, Any]]:
         """Get budget vs actual spending"""
-        from app.models import Budget, Transaction, Category
+        from app.models import Budget, Transaction, Category, Account
 
         budgets = self.db.query(Budget).filter(Budget.is_active == True).all()
         performance = []
 
         for budget in budgets:
             # Calculate actual spending for the budget period
-            actual_spent = self.db.query(func.sum(Transaction.amount)).filter(
-                Transaction.category_id == budget.category_id,
-                Transaction.transaction_type == 'expense',
-                Transaction.transaction_date.between(budget.period_start, budget.period_end)
-            ).scalar() or 0
+            actual_spent = (
+                self.db.query(func.sum(Transaction.amount))
+                .outerjoin(Account, Transaction.account_id == Account.id)
+                .filter(
+                    Transaction.category_id == budget.category_id,
+                    Transaction.transaction_type == 'expense',
+                    Transaction.transaction_date.between(budget.period_start, budget.period_end),
+                    self._exclude_credit_card_filter(),
+                )
+                .scalar()
+                or 0
+            )
 
             actual_spent = abs(actual_spent)
 
@@ -213,7 +247,7 @@ class AnalyticsService:
 
     def get_cash_flow_forecast(self, months: int = 6) -> List[Dict[str, Any]]:
         """Generate cash flow forecast"""
-        from app.models import Transaction, Income
+        from app.models import Transaction, Income, Account
 
         forecast = []
         current_date = datetime.now()
@@ -229,11 +263,18 @@ class AnalyticsService:
             ).scalar() or 0
 
             # Projected expenses
-            monthly_expenses = self.db.query(func.sum(Transaction.amount)).filter(
-                Transaction.transaction_type == 'expense',
-                extract('month', Transaction.transaction_date) == month_start.month,
-                extract('year', Transaction.transaction_date) == month_start.year
-            ).scalar() or 0
+            monthly_expenses = (
+                self.db.query(func.sum(Transaction.amount))
+                .outerjoin(Account, Transaction.account_id == Account.id)
+                .filter(
+                    Transaction.transaction_type == 'expense',
+                    extract('month', Transaction.transaction_date) == month_start.month,
+                    extract('year', Transaction.transaction_date) == month_start.year,
+                    self._exclude_credit_card_filter(),
+                )
+                .scalar()
+                or 0
+            )
 
             monthly_expenses = abs(monthly_expenses)
 
