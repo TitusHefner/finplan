@@ -40,6 +40,9 @@ export default function BalanceTracker() {
   const [piDate, setPiDate] = useState('');
   const [piSaving, setPiSaving] = useState(false);
   const [dayBreakdown, setDayBreakdown] = useState([]);
+  const [recurringOccurrences, setRecurringOccurrences] = useState([]);
+  const [overrideSavingKey, setOverrideSavingKey] = useState('');
+  const [selectedOverrideDate, setSelectedOverrideDate] = useState('');
   const [plaidBalances, setPlaidBalances] = useState([]);
   const [plaidHistory, setPlaidHistory] = useState([]);
   const [trackerAccountId, setTrackerAccountId] = useState(null);
@@ -120,6 +123,17 @@ export default function BalanceTracker() {
       .then(res => setDayBreakdown(res.data))
       .catch(() => {});
   }, [days, estimationMethod, avgMonths]);
+
+  const fetchRecurringOccurrences = useCallback(() => {
+    const params = new URLSearchParams({
+      days,
+      from_snapshot: 'true',
+      only_expenses: 'true',
+    });
+    axios.get(`/api/balance/recurring-occurrences?${params}`)
+      .then(res => setRecurringOccurrences(res.data || []))
+      .catch(() => setRecurringOccurrences([]));
+  }, [days]);
 
   const fetchPlaidBalances = useCallback(() => {
     axios.get('/api/plaid/balances')
@@ -252,7 +266,8 @@ export default function BalanceTracker() {
   useEffect(() => {
     fetchProjection();
     fetchDayBreakdown();
-  }, [fetchProjection, fetchDayBreakdown]);
+    fetchRecurringOccurrences();
+  }, [fetchProjection, fetchDayBreakdown, fetchRecurringOccurrences]);
 
   useEffect(() => {
     fetchBreakdown();
@@ -318,11 +333,36 @@ export default function BalanceTracker() {
         fetchCurrent();
         fetchHistory();
         fetchProjection();
+        fetchDayBreakdown();
+        fetchRecurringOccurrences();
         fetchBreakdown();
       })
       .catch(() => setError('Failed to save balance. Please try again.'))
       .finally(() => setSaving(false));
   };
+
+  const handleToggleRecurringOverride = (item) => {
+    const key = `${item.transaction_id}-${item.occurrence_date}`;
+    setOverrideSavingKey(key);
+    axios.put('/api/balance/recurring-occurrence-override', {
+      transaction_id: item.transaction_id,
+      occurrence_date: `${item.occurrence_date}T00:00:00`,
+      is_overridden: !item.is_overridden,
+    })
+      .then(() => {
+        fetchProjection();
+        fetchDayBreakdown();
+        fetchRecurringOccurrences();
+      })
+      .finally(() => setOverrideSavingKey(''));
+  };
+
+  const recurringOnSelectedDate = useMemo(() => {
+    if (!selectedOverrideDate) return [];
+    return recurringOccurrences
+      .filter(item => item.occurrence_date === selectedOverrideDate)
+      .sort((a, b) => a.description.localeCompare(b.description));
+  }, [recurringOccurrences, selectedOverrideDate]);
 
   // Safety buffer analysis
   const fmt = (n) =>
@@ -565,6 +605,14 @@ export default function BalanceTracker() {
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
+    onClick: (_event, elements, chart) => {
+      if (!elements || elements.length === 0) return;
+      const point = elements[0];
+      const idx = point?.index;
+      if (idx == null) return;
+      const clickedDate = chart?.data?.labels?.[idx];
+      if (clickedDate) setSelectedOverrideDate(String(clickedDate));
+    },
     plugins: {
       legend: {
         display: true,
@@ -864,6 +912,66 @@ export default function BalanceTracker() {
           </p>
         )}
 
+        {allDates.length > 0 && (
+          <div style={{ marginTop: '14px', padding: '12px', border: '1px solid #e5e7eb', borderRadius: 8, background: '#fafafa' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <div style={{ fontSize: 13, color: '#374151' }}>
+                Click any date on the chart to manage recurring overrides for that day.
+              </div>
+              {selectedOverrideDate && (
+                <button
+                  onClick={() => setSelectedOverrideDate('')}
+                  style={{ ...pillStyle, background: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db' }}
+                >
+                  Clear selection
+                </button>
+              )}
+            </div>
+
+            {!selectedOverrideDate ? (
+              <div style={{ marginTop: 10, fontSize: 13, color: '#9ca3af' }}>
+                No date selected.
+              </div>
+            ) : recurringOnSelectedDate.length === 0 ? (
+              <div style={{ marginTop: 10, fontSize: 13, color: '#9ca3af' }}>
+                No recurring expense occurrences on {new Date(`${selectedOverrideDate}T00:00:00`).toLocaleDateString()}.
+              </div>
+            ) : (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: '#111827', marginBottom: 8 }}>
+                  Recurring expenses on {new Date(`${selectedOverrideDate}T00:00:00`).toLocaleDateString()}
+                </div>
+                <div style={{ display: 'grid', gap: 8 }}>
+                  {recurringOnSelectedDate.map((item) => {
+                    const rowKey = `${item.transaction_id}-${item.occurrence_date}`;
+                    const isSaving = overrideSavingKey === rowKey;
+                    return (
+                      <div key={rowKey} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '8px 10px', border: '1px solid #e5e7eb', borderRadius: 6, background: '#fff' }}>
+                        <div>
+                          <div style={{ fontSize: 14, color: '#111827' }}>{item.description}</div>
+                          <div style={{ fontSize: 12, color: '#6b7280' }}>{fmt(item.amount)}</div>
+                        </div>
+                        <button
+                          onClick={() => handleToggleRecurringOverride(item)}
+                          disabled={isSaving}
+                          style={{
+                            ...pillStyle,
+                            background: item.is_overridden ? '#dcfce7' : '#fff7ed',
+                            color: item.is_overridden ? '#166534' : '#9a3412',
+                            border: '1px solid #e5e7eb',
+                          }}
+                        >
+                          {isSaving ? 'Saving…' : item.is_overridden ? 'Unskip' : 'Skip'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {allDates.length > 0 && effectiveProjection.length > 0 && (() => {
           const last = effectiveProjection[effectiveProjection.length - 1];
           const allPoints = [...history, ...projection];
@@ -945,6 +1053,63 @@ export default function BalanceTracker() {
         Projection combines recurring transactions (scheduled on exact dates) and estimated variable spending (spread daily).
         Actual transactions update your current balance automatically.
       </p>
+
+      {/* Recurring occurrence overrides */}
+      <div style={cardStyle}>
+        <h3 style={{ marginTop: 0 }}>Recurring Expense Overrides</h3>
+        <p style={{ color: '#6b7280', fontSize: '13px', marginBottom: '14px' }}>
+          If you pay something early (like rent), use Skip on that specific date so it is not applied again in projection.
+        </p>
+        {recurringOccurrences.length === 0 ? (
+          <p style={{ color: '#9ca3af', fontSize: '13px', margin: 0 }}>No recurring expense occurrences found in this date range.</p>
+        ) : (
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px' }}>
+            <thead>
+              <tr style={{ background: '#f9fafb' }}>
+                <th style={thStyle}>Date</th>
+                <th style={thStyle}>Recurring Expense</th>
+                <th style={{ ...thStyle, textAlign: 'right' }}>Amount</th>
+                <th style={thStyle}>Status</th>
+                <th style={thStyle}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {recurringOccurrences.map((item) => {
+                const rowKey = `${item.transaction_id}-${item.occurrence_date}`;
+                const isSaving = overrideSavingKey === rowKey;
+                return (
+                  <tr key={rowKey} style={{ borderBottom: '1px solid #f3f4f6', background: selectedOverrideDate === item.occurrence_date ? '#f8fafc' : '#fff' }}>
+                    <td style={tdStyle}>{new Date(`${item.occurrence_date}T00:00:00`).toLocaleDateString()}</td>
+                    <td style={tdStyle}>{item.description}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', color: '#dc2626' }}>{fmt(item.amount)}</td>
+                    <td style={tdStyle}>
+                      {item.is_overridden
+                        ? <span style={{ color: '#b45309', fontWeight: 600 }}>Skipped (manual)</span>
+                        : item.auto_fulfilled_early
+                          ? <span style={{ color: '#0891b2', fontWeight: 600 }}>Auto-skipped (paid early)</span>
+                          : <span style={{ color: '#16a34a', fontWeight: 600 }}>Included</span>}
+                    </td>
+                    <td style={tdStyle}>
+                      <button
+                        onClick={() => handleToggleRecurringOverride(item)}
+                        disabled={isSaving}
+                        style={{
+                          ...pillStyle,
+                          background: item.is_overridden ? '#dcfce7' : '#fff7ed',
+                          color: item.is_overridden ? '#166534' : '#9a3412',
+                          border: '1px solid #e5e7eb',
+                        }}
+                      >
+                        {isSaving ? 'Saving…' : item.is_overridden ? 'Unskip' : 'Skip'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
 
       {/* Variable spending breakdown */}
       {variableBreakdown.length > 0 && (

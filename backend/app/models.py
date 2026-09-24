@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Enum
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Enum, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -291,6 +291,22 @@ class PlannedIncome(Base):
     amount = Column(Float, nullable=False)
     planned_date = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RecurringOccurrenceOverride(Base):
+    """Manual include/skip override for one recurring transaction occurrence date."""
+    __tablename__ = "recurring_occurrence_overrides"
+    __table_args__ = (
+        UniqueConstraint("transaction_id", "occurrence_date", name="uq_recurring_override_tx_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    transaction_id = Column(Integer, ForeignKey("transactions.id"), nullable=False, index=True)
+    occurrence_date = Column(DateTime, nullable=False, index=True)
+    is_skipped = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    transaction = relationship("Transaction")
 
 
 # Plaid Integration

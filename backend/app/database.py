@@ -66,6 +66,14 @@ def _run_migrations():
             planned_date DATETIME NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )""",
+        """CREATE TABLE IF NOT EXISTS recurring_occurrence_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id INTEGER NOT NULL REFERENCES transactions(id),
+            occurrence_date DATETIME NOT NULL,
+            is_skipped BOOLEAN NOT NULL DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_recurring_override_tx_date ON recurring_occurrence_overrides (transaction_id, occurrence_date)",
         "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)",
         """CREATE TABLE IF NOT EXISTS budget_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

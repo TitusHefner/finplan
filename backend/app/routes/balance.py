@@ -89,11 +89,32 @@ class ProjectionPoint(BaseModel):
 class BreakdownItem(BaseModel):
     label: str
     amount: float  # positive = income, negative = expense
+    transaction_id: Optional[int] = None
+    occurrence_date: Optional[str] = None
+    is_overridden: Optional[bool] = None
 
 
 class BreakdownDay(BaseModel):
     date: str
     items: List[BreakdownItem]
+
+
+class RecurringOccurrenceItem(BaseModel):
+    transaction_id: int
+    description: str
+    transaction_type: str
+    amount: float
+    occurrence_date: str
+    is_overridden: bool
+    auto_fulfilled_early: bool
+    effective_in_projection: bool
+
+
+class RecurringOccurrenceOverridePayload(BaseModel):
+    transaction_id: int
+    occurrence_date: datetime
+    is_overridden: bool
+
 
 class CategoryEstimate(BaseModel):
     category_id: Optional[int]
@@ -272,6 +293,29 @@ def _get_latest_snapshot(db: Session) -> models.BalanceSnapshot | None:
         .order_by(models.BalanceSnapshot.snapshot_date.desc())
         .first()
     )
+
+
+def _normalize_day(dt: datetime) -> datetime:
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _recurring_override_keys(
+    db: Session,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> set[tuple[int, str]]:
+    q = db.query(models.RecurringOccurrenceOverride).filter(
+        models.RecurringOccurrenceOverride.is_skipped == True,
+    )
+    if start is not None:
+        q = q.filter(models.RecurringOccurrenceOverride.occurrence_date >= _normalize_day(start))
+    if end is not None:
+        q = q.filter(models.RecurringOccurrenceOverride.occurrence_date < _normalize_day(end) + timedelta(days=1))
+
+    return {
+        (row.transaction_id, row.occurrence_date.strftime("%Y-%m-%d"))
+        for row in q.all()
+    }
 
 
 def _is_fulfilled_early(
@@ -675,6 +719,7 @@ def get_balance_projection(
         actual_txs_q = actual_txs_q.filter((models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)))
     actual_txs_for_check = actual_txs_q.all()
     legacy_income_txs = db.query(models.Income).all()
+    override_keys = _recurring_override_keys(db, start, end)
 
     # --- Recurring transactions (scheduled on exact days) ---
     for tx in recurring_txs:
@@ -694,6 +739,8 @@ def get_balance_projection(
         ):
             key = occ.strftime("%Y-%m-%d")
             if key in daily_delta:
+                if (tx.id, key) in override_keys:
+                    continue
                 if _is_fulfilled_early(tx, occ, actual_txs_for_check, today):
                     continue  # payment already came out early
                 daily_delta[key] += sign * amount
@@ -829,6 +876,7 @@ def get_projection_breakdown(
         _atx_q = _atx_q.filter((models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)))
     actual_txs_for_check = _atx_q.all()
     legacy_income_txs = db.query(models.Income).all()
+    override_keys = _recurring_override_keys(db, start, end)
 
     # --- Recurring transactions (exclude transfers) ---
     recurring_txs = (
@@ -858,9 +906,17 @@ def get_projection_breakdown(
         ):
             key = occ.strftime("%Y-%m-%d")
             if key in day_items or (start <= occ < end):
+                if (tx.id, key) in override_keys:
+                    continue
                 if _is_fulfilled_early(tx, occ, actual_txs_for_check, today):
                     continue  # payment already came out early
-                day_items[key].append(BreakdownItem(label=label, amount=round(signed_amount, 2)))
+                day_items[key].append(BreakdownItem(
+                    label=label,
+                    amount=round(signed_amount, 2),
+                    transaction_id=tx.id,
+                    occurrence_date=key,
+                    is_overridden=False,
+                ))
 
     for income in legacy_income_txs:
         label = (income.source or "Income")[:45]
@@ -979,3 +1035,114 @@ def delete_planned_income(income_id: int, db: Session = Depends(database.get_db)
         db.delete(item)
         db.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Recurring occurrence overrides (skip/include one specific date)
+# ---------------------------------------------------------------------------
+
+@router.get("/recurring-occurrences", response_model=List[RecurringOccurrenceItem])
+def list_recurring_occurrences(
+    days: int = Query(default=120, ge=1, le=365),
+    from_snapshot: bool = Query(default=True),
+    only_expenses: bool = Query(default=True),
+    db: Session = Depends(database.get_db),
+):
+    snapshot = _get_latest_snapshot(db)
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = snapshot.snapshot_date.replace(hour=0, minute=0, second=0, microsecond=0) if (from_snapshot and snapshot) else today
+    end = today + timedelta(days=days)
+
+    liability_ids = _liability_account_ids(db)
+    actual_txs_q = db.query(models.Transaction).filter(
+        models.Transaction.transaction_date >= start - timedelta(days=366),
+        models.Transaction.transaction_date < end,
+        models.Transaction.transaction_type.in_([
+            models.TransactionType.INCOME,
+            models.TransactionType.EXPENSE,
+        ]),
+    )
+    if liability_ids:
+        actual_txs_q = actual_txs_q.filter((models.Transaction.account_id == None) | (~models.Transaction.account_id.in_(liability_ids)))
+    actual_txs_for_check = actual_txs_q.all()
+
+    recurring_q = db.query(models.Transaction).filter(
+        models.Transaction.is_recurring == True,
+        models.Transaction.transaction_type.in_([
+            models.TransactionType.INCOME,
+            models.TransactionType.EXPENSE,
+        ]),
+    )
+    if only_expenses:
+        recurring_q = recurring_q.filter(models.Transaction.transaction_type == models.TransactionType.EXPENSE)
+    recurring_txs = recurring_q.order_by(models.Transaction.description.asc()).all()
+
+    override_keys = _recurring_override_keys(db, start, end)
+    out: list[RecurringOccurrenceItem] = []
+
+    for tx in recurring_txs:
+        if not tx.recurring_frequency:
+            continue
+        signed_amount = abs(tx.amount) if tx.transaction_type == models.TransactionType.INCOME else -abs(tx.amount)
+        for occ in _occurrences_in_range(
+            tx.recurring_frequency,
+            tx.recurring_day,
+            start,
+            end,
+            tx.recurring_start_date or tx.transaction_date,
+            end_date_limit=tx.recurring_end_date,
+        ):
+            date_key = occ.strftime("%Y-%m-%d")
+            is_overridden = (tx.id, date_key) in override_keys
+            auto_fulfilled = _is_fulfilled_early(tx, occ, actual_txs_for_check, today)
+            out.append(RecurringOccurrenceItem(
+                transaction_id=tx.id,
+                description=(tx.description or "Recurring")[:120],
+                transaction_type=_enum_str(tx.transaction_type),
+                amount=round(signed_amount, 2),
+                occurrence_date=date_key,
+                is_overridden=is_overridden,
+                auto_fulfilled_early=auto_fulfilled,
+                effective_in_projection=(not is_overridden) and (not auto_fulfilled),
+            ))
+
+    out.sort(key=lambda x: (x.occurrence_date, x.description.lower()))
+    return out
+
+
+@router.put("/recurring-occurrence-override")
+def set_recurring_occurrence_override(
+    payload: RecurringOccurrenceOverridePayload,
+    db: Session = Depends(database.get_db),
+):
+    tx = db.query(models.Transaction).filter(models.Transaction.id == payload.transaction_id).first()
+    if not tx or not tx.is_recurring:
+        return {"ok": False, "error": "Recurring transaction not found"}
+
+    day = _normalize_day(payload.occurrence_date)
+
+    existing = db.query(models.RecurringOccurrenceOverride).filter(
+        models.RecurringOccurrenceOverride.transaction_id == payload.transaction_id,
+        models.RecurringOccurrenceOverride.occurrence_date == day,
+    ).first()
+
+    if payload.is_overridden:
+        if existing:
+            existing.is_skipped = True
+        else:
+            db.add(models.RecurringOccurrenceOverride(
+                transaction_id=payload.transaction_id,
+                occurrence_date=day,
+                is_skipped=True,
+            ))
+    else:
+        if existing:
+            db.delete(existing)
+
+    db.commit()
+    return {
+        "ok": True,
+        "transaction_id": payload.transaction_id,
+        "occurrence_date": day.strftime("%Y-%m-%d"),
+        "is_overridden": bool(payload.is_overridden),
+    }
